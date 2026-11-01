@@ -41,3 +41,15 @@ dist/
 logs/
 cache/
 runtime/
+
+
+# Added by cargo
+
+/target
+
+# Rust build files
+/target/
+**/target/
+
+# Rust backups
+**/*.rs.bk
