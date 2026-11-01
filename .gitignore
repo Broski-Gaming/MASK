@@ -1,15 +1,10 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Rust build output
+/target/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Rust backups
+**/*.rs.bk
 
-# Environment variables and secrets
+# Secrets and keys (never commit these)
 .env
 .env.*
 !.env.example
@@ -18,38 +13,16 @@ env/
 keys/
 secrets/
 
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Build files
-build/
-dist/
-*.egg-info/
-
-# Linux temporary files
-*~
-.Trash-*/
-
 # MASK runtime data
 logs/
 cache/
 runtime/
 
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
 
-# Added by cargo
-
-/target
-
-# Rust build files
-/target/
-**/target/
-
-# Rust backups
-**/*.rs.bk
+# Linux temporary files
+*~
+.Trash-*/
