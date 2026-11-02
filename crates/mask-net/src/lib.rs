@@ -1,21 +1,22 @@
-//! MASK relay network (v0.2 prototype).
+//! MASK network: **MORP**, the MASK Onion Routing Protocol (experimental).
 //!
-//! **Not anonymous. Not encrypted. Not secure.** Every relay can read every
-//! message and the full route. This milestone only proves that structured,
-//! framed messages can be routed through Entry → Middle → Exit relays on
-//! localhost. Layered (onion) encryption is the next milestone.
+//! **Not reviewed. Do not rely on it for anonymity or security.** MORP is a
+//! learning prototype that runs only on localhost. See `docs/MORP.md` for
+//! the protocol, threat model, and known limitations.
 //!
 //! Modules:
-//! - [`identity`]: relay identities and roles.
-//! - [`protocol`]: wire messages and onion layers (encoding/decoding only).
-//! - [`transport`]: length-prefixed framed TCP connections and the handshake.
-//! - [`relay`]: the Entry / Middle / Exit relay server.
-//! - [`client`]: builds onion-layered payloads and sends test messages.
+//! - [`crypto`]: keys, ntor-style handshake, per-hop authenticated encryption.
+//! - [`descriptor`]: signed relay descriptors, local directory, path choice.
+//! - [`protocol`]: wire messages and onion-layer plaintexts.
+//! - [`transport`]: framed TCP links shared by many circuits.
+//! - [`relay`]: the entry / middle / exit relay server.
+//! - [`client`]: builds circuits and sends data through them.
 //!
-//! This crate has no GUI dependencies, so relays can run on machines without
-//! a desktop. The browser (`mask` crate) will use it through [`client`].
+//! This crate has no GUI dependencies, so relays can run headless.
 
 pub mod client;
+pub mod crypto;
+pub mod descriptor;
 pub mod error;
 pub mod identity;
 pub mod protocol;

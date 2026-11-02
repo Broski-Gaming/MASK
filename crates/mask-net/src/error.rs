@@ -2,7 +2,8 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 
-use crate::protocol::ErrorCode;
+use crate::crypto::CryptoError;
+use crate::protocol::{DestroyReason, ErrorCode, LinkErrorCode};
 
 #[derive(Debug)]
 pub enum NetError {
@@ -10,14 +11,24 @@ pub enum NetError {
     Decode(postcard::Error),
     Timeout,
     ConnectionClosed,
-    /// The peer broke the handshake or protocol rules.
+    /// The peer broke the protocol rules.
     Protocol(String),
-    /// A relay on the route reported an error.
+    Crypto(CryptoError),
+    /// The neighbour refused the link handshake.
+    LinkRejected {
+        code: LinkErrorCode,
+        detail: String,
+    },
+    /// The circuit was torn down.
+    Destroyed(DestroyReason),
+    /// Hop number `hop` (0 = entry) reported that a command failed.
     Remote {
+        hop: usize,
         code: ErrorCode,
         detail: String,
     },
-    /// v0.2 only runs on loopback addresses.
+    Descriptor(String),
+    /// MORP currently only runs on loopback addresses.
     NotLoopback(SocketAddr),
     InvalidConfig(String),
 }
@@ -28,12 +39,20 @@ impl fmt::Display for NetError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Decode(e) => write!(f, "malformed message: {e}"),
             Self::Timeout => write!(f, "timed out"),
-            Self::ConnectionClosed => write!(f, "connection closed by peer"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            Self::Remote { code, detail } => write!(f, "relay error {code}: {detail}"),
+            Self::Crypto(e) => write!(f, "cryptographic check failed: {e}"),
+            Self::LinkRejected { code, detail } => {
+                write!(f, "link rejected ({code:?}): {detail}")
+            }
+            Self::Destroyed(reason) => write!(f, "circuit destroyed ({reason:?})"),
+            Self::Remote { hop, code, detail } => {
+                write!(f, "hop {} reported {code:?}: {detail}", hop + 1)
+            }
+            Self::Descriptor(msg) => write!(f, "relay descriptor: {msg}"),
             Self::NotLoopback(addr) => write!(
                 f,
-                "{addr} is not a loopback address; MASK v0.2 only runs on 127.0.0.1"
+                "{addr} is not a loopback address; MORP currently only runs on 127.0.0.1"
             ),
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),
         }
@@ -45,6 +64,7 @@ impl std::error::Error for NetError {
         match self {
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
+            Self::Crypto(e) => Some(e),
             _ => None,
         }
     }
@@ -59,5 +79,11 @@ impl From<io::Error> for NetError {
 impl From<postcard::Error> for NetError {
     fn from(e: postcard::Error) -> Self {
         Self::Decode(e)
+    }
+}
+
+impl From<CryptoError> for NetError {
+    fn from(e: CryptoError) -> Self {
+        Self::Crypto(e)
     }
 }

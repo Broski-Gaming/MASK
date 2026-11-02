@@ -1,145 +1,170 @@
-//! Wire protocol.
+//! MORP wire format. See `docs/MORP.md` for the full description.
 //!
-//! Two levels, deliberately kept apart so encryption can slot in between:
+//! Two levels:
 //!
-//! 1. [`Message`] is what travels on a TCP link between two neighbours
-//!    (client ↔ entry, entry ↔ middle, middle ↔ exit). Each message is
-//!    one length-prefixed frame (see [`crate::transport`]).
-//! 2. [`OnionLayer`] is the per-hop instruction carried *inside*
-//!    `Message::Relay { payload }`. The client builds one layer per relay,
-//!    nested: the entry's layer contains the middle's, which contains the
-//!    exit's. Each relay peels exactly one layer.
-//!
-//! Today `payload` is a plain postcard-encoded `OnionLayer`, so every relay
-//! can read it. **Next milestone:** each layer becomes ciphertext encrypted to
-//! that hop's key; a relay decrypts its layer, learns only the next hop, and
-//! forwards the still-encrypted rest. Responses travel back the same path and
-//! gain one encryption layer per hop. The `Message` level does not change.
+//! 1. [`LinkMsg`]: what travels on one TCP link between neighbours, one
+//!    postcard-encoded message per length-prefixed frame. Visible to anyone
+//!    who can observe the link (links are not yet encrypted).
+//! 2. [`LayerBody`]: the plaintext of one onion layer, sealed with that hop's
+//!    key and carried in `LinkMsg::Relay { cell }`. A hop that opens its
+//!    layer finds either another sealed cell to pass along
+//!    ([`LayerBody::Relay`]) or a command for itself ([`LayerBody::Cmd`]).
 
-use std::fmt;
 use std::net::SocketAddr;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{NodeId, Role};
+use crate::crypto::ntor::{CreateReply, CreateRequest};
+use crate::identity::Role;
 
-/// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// MORP protocol version, checked in the link handshake.
+pub const MORP_VERSION: u16 = 1;
 
-/// Largest frame accepted on any link. Bounds memory used per message.
+/// Largest frame accepted on any link.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// A message on one link between neighbouring nodes.
+/// Largest application payload a client may send in one DATA command,
+/// leaving room for three layers of headers and tags inside one frame.
+pub const MAX_DATA_LEN: usize = 60 * 1024;
+
+/// Circuit identifier, unique per link. Chosen by the side that opened the
+/// link; 0 is reserved.
+pub type CircId = u32;
+
+/// Message on one link.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Message {
-    /// First message from the connecting side.
-    Hello {
-        version: u16,
-        role: Role,
-        node_id: NodeId,
+pub enum LinkMsg {
+    /// First message from the side opening the link.
+    Hello { version: u16, role: Role },
+    /// Reply to an acceptable `Hello`.
+    Welcome { version: u16, role: Role },
+    /// Fatal link-level error, sent just before closing the link.
+    LinkError { code: LinkErrorCode, detail: String },
+
+    /// Open circuit `circ` on this link with an ntor handshake.
+    Create {
+        circ: CircId,
+        request: CreateRequest,
     },
-    /// Relay's reply to an acceptable `Hello`.
-    Welcome {
-        version: u16,
-        role: Role,
-        node_id: NodeId,
-    },
-    /// Onion payload travelling away from the client.
-    Relay { payload: Vec<u8> },
-    /// Reply payload travelling back toward the client.
-    RelayResponse { payload: Vec<u8> },
-    /// Something went wrong at this hop or further along the route.
-    Error { code: ErrorCode, detail: String },
+    /// Handshake reply for `circ`.
+    Created { circ: CircId, reply: CreateReply },
+    /// One onion cell on `circ`. Direction is implied by the link: away from
+    /// the client on a relay's inbound link, toward it on an outbound link.
+    Relay { circ: CircId, cell: Vec<u8> },
+    /// Tear down `circ`. Not authenticated (see docs/MORP.md).
+    Destroy { circ: CircId, reason: DestroyReason },
 }
 
-/// One relay's instruction, peeled from `Message::Relay { payload }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkErrorCode {
+    VersionMismatch,
+    BadHandshake,
+    RoleNotAllowed,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestroyReason {
+    /// The client closed the circuit.
+    Requested,
+    ProtocolViolation,
+    /// A cell failed AEAD verification (tampering, replay, or reordering).
+    AuthenticationFailed,
+    /// CREATE was addressed to a different identity or onion key.
+    WrongRelay,
+    NextHopFailed,
+    Timeout,
+    LinkClosed,
+    ResourceLimit,
+}
+
+/// Plaintext of one onion layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OnionLayer {
-    /// Send `inner` to the relay at `next_hop`.
-    Forward {
+pub enum LayerBody {
+    /// A sealed cell for (forward) or from (backward) a hop further along.
+    Relay(Vec<u8>),
+    /// A command for (forward) or from (backward) this hop.
+    Cmd(RelayCmd),
+}
+
+/// Commands exchanged end-to-end between the client and one hop.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayCmd {
+    /// Client → hop: extend the circuit to `next_hop` with this handshake.
+    Extend {
         next_hop: SocketAddr,
-        inner: Vec<u8>,
+        request: CreateRequest,
     },
-    /// Final layer, for the exit: hand `data` to the exit service.
-    Deliver { data: Vec<u8> },
+    /// Hop → client: the next hop's handshake reply.
+    Extended { reply: CreateReply },
+    /// Application data. In this prototype the exit echoes it back.
+    Data { bytes: Vec<u8> },
+    /// Hop → client: a command failed. The circuit stays open.
+    Error { code: ErrorCode, detail: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
-    VersionMismatch,
-    BadHandshake,
-    RoleNotAllowed,
-    MalformedMessage,
-    MalformedLayer,
-    LayerNotAllowed,
-    NextHopRejected,
+    /// The hop refused to extend (bad address, or the next hop refused CREATE).
+    ExtendRejected,
     NextHopUnreachable,
+    /// The command is not allowed at this hop.
+    NotAllowed,
     Timeout,
 }
 
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
+pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+    postcard::to_stdvec(value).expect("MORP types always serialize")
 }
 
-impl Message {
-    pub fn encode(&self) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_stdvec(self)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
-    }
-}
-
-impl OnionLayer {
-    pub fn encode(&self) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_stdvec(self)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
-    }
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
+    postcard::from_bytes(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::NodeId;
 
     #[test]
-    fn messages_round_trip() {
+    fn link_messages_round_trip() {
+        let request = CreateRequest {
+            node_id: NodeId::from_bytes([1; 32]),
+            onion_key: [2; 32],
+            client_public: [3; 32],
+        };
         let messages = [
-            Message::Hello {
-                version: PROTOCOL_VERSION,
+            LinkMsg::Hello {
+                version: MORP_VERSION,
                 role: Role::Client,
-                node_id: NodeId::from_bytes([7; 32]),
             },
-            Message::Relay {
-                payload: vec![1, 2, 3],
+            LinkMsg::Create { circ: 7, request },
+            LinkMsg::Relay {
+                circ: u32::MAX,
+                cell: vec![9; 100],
             },
-            Message::Error {
-                code: ErrorCode::Timeout,
-                detail: "slow".into(),
+            LinkMsg::Destroy {
+                circ: 1,
+                reason: DestroyReason::Timeout,
             },
         ];
         for msg in messages {
-            assert_eq!(Message::decode(&msg.encode().unwrap()).unwrap(), msg);
+            assert_eq!(decode::<LinkMsg>(&encode(&msg)).unwrap(), msg);
         }
     }
 
     #[test]
-    fn layers_round_trip() {
-        let layer = OnionLayer::Forward {
-            next_hop: "127.0.0.1:7102".parse().unwrap(),
-            inner: b"inner".to_vec(),
-        };
-        assert_eq!(OnionLayer::decode(&layer.encode().unwrap()).unwrap(), layer);
+    fn layer_bodies_round_trip() {
+        let body = LayerBody::Cmd(RelayCmd::Data {
+            bytes: b"hi".to_vec(),
+        });
+        assert_eq!(decode::<LayerBody>(&encode(&body)).unwrap(), body);
     }
 
     #[test]
     fn garbage_does_not_decode() {
-        assert!(Message::decode(&[0xff, 0xff, 0xff]).is_err());
-        assert!(OnionLayer::decode(&[]).is_err());
+        assert!(decode::<LinkMsg>(&[0xff, 0xff, 0xff]).is_err());
+        assert!(decode::<LayerBody>(&[]).is_err());
     }
 }

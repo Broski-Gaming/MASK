@@ -1,26 +1,21 @@
-//! Relay identities and roles.
+//! Node identifiers and roles.
 //!
-//! In v0.2 a [`NodeId`] is 32 random bytes generated each time a relay
-//! starts. It is a label for logging and handshakes, not a cryptographic
-//! identity: it proves nothing about who the peer is. A later milestone will
-//! replace it with the fingerprint of a long-term public key.
+//! A relay's [`NodeId`] is its Ed25519 identity public key. It is stable for
+//! as long as the relay keeps its identity key file (see
+//! [`crate::crypto::keys`]). Clients learn node IDs from signed relay
+//! descriptors and authenticate each hop against them during the MORP
+//! handshake.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Ed25519 identity public key of a relay.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
-    /// A fresh random ID from the operating system's random number generator.
-    pub fn random() -> Self {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).expect("operating system RNG unavailable");
-        Self(bytes)
-    }
-
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -31,13 +26,13 @@ impl NodeId {
 
     /// First 8 bytes as hex, for log lines.
     pub fn short(&self) -> String {
-        hex(&self.0[..8])
+        to_hex(&self.0[..8])
     }
 }
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&hex(&self.0))
+        f.write_str(&to_hex(&self.0))
     }
 }
 
@@ -47,11 +42,22 @@ impl fmt::Debug for NodeId {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The part a node plays on a route.
+pub fn from_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The part a node plays on a circuit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     Client,
@@ -61,7 +67,7 @@ pub enum Role {
 }
 
 impl Role {
-    /// The only role allowed to connect to a relay of this role.
+    /// The only role allowed to open a link to a relay of this role.
     pub const fn expected_upstream(self) -> Option<Role> {
         match self {
             Role::Entry => Some(Role::Client),
@@ -71,7 +77,7 @@ impl Role {
         }
     }
 
-    /// The role this relay must find at its next hop.
+    /// The role this node's next hop must have.
     pub const fn expected_downstream(self) -> Option<Role> {
         match self {
             Role::Client => Some(Role::Entry),
@@ -113,32 +119,9 @@ impl FromStr for Role {
     }
 }
 
-/// Everything a relay says about itself.
-#[derive(Clone, Debug)]
-pub struct RelayIdentity {
-    pub nickname: String,
-    pub role: Role,
-    pub node_id: NodeId,
-}
-
-impl RelayIdentity {
-    pub fn generate(nickname: impl Into<String>, role: Role) -> Self {
-        Self {
-            nickname: nickname.into(),
-            role,
-            node_id: NodeId::random(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn random_ids_differ() {
-        assert_ne!(NodeId::random(), NodeId::random());
-    }
 
     #[test]
     fn id_formats_as_hex() {
@@ -148,12 +131,19 @@ mod tests {
     }
 
     #[test]
+    fn hex_round_trips_and_rejects_bad_input() {
+        let bytes = [0x01, 0xfe, 0x7a];
+        assert_eq!(from_hex::<3>(&to_hex(&bytes)), Some(bytes));
+        assert_eq!(from_hex::<3>("01fe7"), None);
+        assert_eq!(from_hex::<3>("01fezz"), None);
+    }
+
+    #[test]
     fn route_order_is_client_entry_middle_exit() {
         assert_eq!(Role::Entry.expected_upstream(), Some(Role::Client));
         assert_eq!(Role::Middle.expected_upstream(), Some(Role::Entry));
         assert_eq!(Role::Exit.expected_upstream(), Some(Role::Middle));
         assert_eq!(Role::Exit.expected_downstream(), None);
-        assert_eq!(Role::Client.expected_upstream(), None);
     }
 
     #[test]

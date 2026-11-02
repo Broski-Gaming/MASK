@@ -52,12 +52,51 @@ start and prove nothing. Peer roles in the handshake are self-declared.
 - Message sizes are visible (no fixed-size cells or padding).
 - No limit on the number of simultaneous connections.
 
-## Next: layered onion encryption
+## v0.3 — MORP v1: encrypted onion routing (2026-11-01)
 
-Planned, not started:
-- Persistent relay identity keys (Ed25519) with node ID = key fingerprint.
-- Per-hop key agreement (X25519) and authenticated encryption of each
-  `OnionLayer` with RustCrypto crates.
-- Replies encrypted once per hop on the way back.
-- Consider fixed-size cells to hide message lengths.
-- Tests that a relay cannot read layers meant for other hops.
+Full specification, threat model, and limitations: `docs/MORP.md`.
+
+**Done**
+- Replaced the v0.2 plaintext protocol with MORP v1 (v0.2 code remains in
+  Git history).
+- Relay identity: Ed25519 key in `runtime/relays/<name>/identity.key`
+  (mode 0600; refuses to start if group/other can read it). Fresh X25519
+  onion key on every start.
+- Signed relay descriptors (`runtime/directory/<name>.json`), verified
+  with `verify_strict`; tampered or malformed descriptors are skipped.
+  Relays withdraw their descriptor on Ctrl+C.
+- Telescoping circuits: CREATE to the entry, EXTEND through entry and
+  middle. ntor-style handshake (adapted from Tor) with X25519,
+  HKDF-SHA256, HMAC-SHA256; low-order keys rejected; constant-time MAC check.
+- Layered ChaCha20-Poly1305: separate keys per hop and direction, implicit
+  64-bit counter nonces, no wraparound. Replayed, reordered, dropped, or
+  modified cells fail authentication and destroy the circuit.
+- Encrypted replies: each hop adds one backward layer; the client peels
+  them and knows which hop answered.
+- Circuit IDs: random per-link u32s; many circuits and many clients share
+  links; relays reuse one outbound link per next hop.
+- Errors (`NextHopUnreachable`, `ExtendRejected`, `NotAllowed`,
+  `Timeout`) returned to the client encrypted by the reporting hop; a
+  failed EXTEND leaves the partial circuit usable.
+- Limits: 64 KiB frames, 60 KiB data per cell, 128 circuits per link,
+  4096 per relay, connect/handshake/response/idle timeouts.
+- `mask-client` loads the directory, prints the verified path, supports
+  `--circuits N`.
+- Tests: 32 unit (keys, handshake, AEAD, descriptors, protocol) + 26
+  end-to-end (routing, concurrency, layer isolation, relay failures,
+  timeouts, stale keys, impostors, replay, tampering, malformed frames,
+  limits). End-to-end suite ran 10× in a row without failures.
+- Manual run with three relay processes: routing, 2 circuits over one link,
+  exit shutdown, stale onion key rejection; no plaintext in relay logs.
+
+**Security status: unreviewed.** See the threat model in `docs/MORP.md`.
+Main gaps: links are plain TCP (no TLS/Noise), variable cell sizes,
+trusted local directory, no guard nodes, error details name relays.
+
+## Next
+
+Candidates, one at a time:
+- Authenticated, encrypted links (TLS 1.3 or Noise) and fixed-size cells.
+- Real exit streams and a local SOCKS5 proxy.
+- Connect the browser to the network (status panel, circuit info).
+- Later: `.mask` hidden services.

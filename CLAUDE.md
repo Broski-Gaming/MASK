@@ -49,17 +49,21 @@ Cargo workspace with two crates:
 - `mask` (repo root, `src/`): the browser. Binary `mask-browser`. GTK3 toolbar is native GTK (not HTML) so web content cannot script browser controls; Wry embeds the WebKitGTK view.
 - `mask-net` (`crates/mask-net/`): the relay network. No GUI dependencies so relays can run headless. Binaries `mask-relay` and `mask-client`.
 
-Network protocol (see `crates/mask-net/src/protocol.rs`):
-- Link level: `Message` enum, postcard-encoded, one per length-prefixed frame (u32 big-endian, max 64 KiB).
-- Handshake: `Hello` → `Welcome`, checks protocol version and role order client → entry → middle → exit.
-- Onion level: `Message::Relay { payload }` carries nested `OnionLayer`s (`Forward { next_hop, inner }` / `Deliver { data }`); each relay peels one. Encryption will be added per layer without changing the `Message` level.
-- Relays only bind to and forward to loopback addresses until the network is ready to leave localhost.
+Network protocol: **MORP** (MASK Onion Routing Protocol). Full spec, threat model, and limitations in `docs/MORP.md` — keep it in sync with the code.
+- Link level: `LinkMsg` (postcard) in u32 length-prefixed frames, max 64 KiB. `Hello`/`Welcome` link handshake checks version and role order client → entry → middle → exit. Many circuits per link via random per-link `u32` circuit IDs.
+- Circuits are telescoping (Tor-style): CREATE to entry, then EXTEND through each hop.
+- Handshake: ntor-style (adapted from Tor) with X25519 + HKDF-SHA256 + HMAC-SHA256, authenticated against the Ed25519 identity and X25519 onion key in a signed relay descriptor.
+- Layers: ChaCha20-Poly1305 per hop and direction; nonces are implicit 64-bit counters (never sent), giving replay/reorder detection. Any failure destroys the circuit.
+- Relay identity keys live in `runtime/relays/<name>/identity.key` (mode 0600, git-ignored); descriptors in `runtime/directory/`. Never commit anything under `runtime/`.
+- Relays only bind to and extend to loopback addresses until the network is ready to leave localhost.
+- Crypto rule: use established primitives from RustCrypto/dalek only; never invent cryptographic algorithms.
 
 ## Milestones
 - [x] v0.1 — Browser window: dark GTK UI, address bar, HTTPS browsing, ephemeral session.
 - [x] v0.2 — Relay network foundation: entry/middle/exit relays on 127.0.0.1, framed structured messages, plaintext onion layers, error propagation, logging, tests.
-- [ ] Next: layered onion encryption (per-hop key exchange, encrypt each layer, encrypted replies), persistent cryptographic relay identities.
-- [ ] Later: SOCKS5 proxy, connecting the browser to the network, `.mask` hidden services.
+- [x] v0.3 — MORP v1: Ed25519 relay identities, signed descriptors, ntor-style handshakes, layered ChaCha20-Poly1305 with replay protection, circuit IDs, encrypted replies, tests. Unreviewed.
+- [ ] Next candidates: TLS/Noise-encrypted links and fixed-size cells; SOCKS5 proxy and real exit streams; connecting the browser to the network.
+- [ ] Later: `.mask` hidden services (introduction points, rendezvous circuits).
 
 ## Project Documentation
 
