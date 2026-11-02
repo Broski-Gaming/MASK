@@ -83,7 +83,16 @@ Spec and threat model: `docs/MORP_HIDDEN_SERVICES.md`.
 - [x] v0.3 — MORP v1: Ed25519 relay identities, signed descriptors, ntor-style handshakes, layered ChaCha20-Poly1305 with replay protection, circuit IDs, encrypted replies, tests. Unreviewed.
 - [x] v0.4 — Cryptographic `.morp` addresses: Ed25519 service identities, signed expiring descriptors, localhost directory, authenticated encrypted service channel, static site hosting, `morp://` in MASK Browser with no DNS/clearnet fallback. Direct localhost prototype (location not hidden). Unreviewed.
 - [x] v0.5 — Relay-routed `.morp` hidden services: rendezvous-role relays, introduction points, rendezvous joins, encrypted introductions, service authentication, end-to-end encrypted multiplexed sessions, descriptor v2 (no location), browser loads full sites via MORP, no-bypass/auth/failure/cleanup tests. Direct v0.4 path removed. Unreviewed, localhost only.
-- [ ] Next candidates: intro point re-establishment and descriptor encryption; TLS/Noise-encrypted links and fixed-size cells; more relays and path rules (guards); browser circuit status panel; SOCKS5 and real exit streams.
+- [x] v0.5 verified (2026-11-01): addresses, relay-only routing, separate joined circuits, no direct connections, safe failure with disconnected and malicious (tampering/black-holing) relays; 141 tests. Report in `docs/PROGRESS.md`.
+- [ ] v0.6 (planned, not started): distributed MORP relays on several Linux machines in a private network. Plan: `docs/V0.6_PLAN.md` (milestones A–F: private network scope + TOML configs, Noise-authenticated links, directory authority + signed consensus, multiple authorities with threshold signatures, cross-machine path rules/guards/intro re-establishment, LAN trial).
+- [ ] Later: fixed-size cells and padding; encrypted/blinded service descriptors; introduction rate limits; browser circuit status panel; external security review before any public deployment.
+
+## Distributed Testnet Rules (v0.6)
+- No public deployment: relays, authorities, directories, and services must refuse public IP addresses; only loopback and private ranges (RFC 1918, 100.64/10, fc00::/7).
+- Every MORP link between machines must be authenticated and encrypted (Noise, keys bound to relay identities) before multi-machine use.
+- Relay discovery comes from signed, expiring consensus documents verified against pinned authority keys in `network.toml`; never trust an unsigned relay list on the network.
+- Relays bind to `listen` and publish `advertise` (`RelayConfig::advertise`).
+- Authority and relay private keys: mode 0600, git-ignored, never committed.
 
 ## Project Documentation
 

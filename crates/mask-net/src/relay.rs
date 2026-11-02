@@ -101,6 +101,10 @@ pub struct RelayConfig {
     pub limits: Limits,
     pub policy: ConnectPolicy,
     pub observer: Option<Observer>,
+    /// Address published in the descriptor, if different from the bound
+    /// address (for example behind port forwarding). Must be loopback in
+    /// this version. `None` publishes the bound address.
+    pub advertise: Option<SocketAddr>,
 }
 
 impl RelayConfig {
@@ -113,6 +117,7 @@ impl RelayConfig {
             limits: Limits::default(),
             policy: ConnectPolicy::allow_all(),
             observer: None,
+            advertise: None,
         }
     }
 }
@@ -256,7 +261,11 @@ impl Relay {
         }
         let listener = TcpListener::bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
-        let descriptor = RelayDescriptor::sign(&keys, &config.nickname, config.role, local_addr);
+        let advertised = config.advertise.unwrap_or(local_addr);
+        if !advertised.ip().is_loopback() {
+            return Err(NetError::NotLoopback(advertised));
+        }
+        let descriptor = RelayDescriptor::sign(&keys, &config.nickname, config.role, advertised);
         Ok(Self {
             inner: Arc::new(Inner {
                 keys,
@@ -610,7 +619,7 @@ impl Inner {
                         ErrorCode::ExtendRejected,
                         format!("{next_hop} is not a loopback address"),
                     ))
-                } else if next_hop == self.local_addr {
+                } else if next_hop == self.local_addr || next_hop == self.descriptor.addr {
                     Some((
                         ErrorCode::ExtendRejected,
                         "cannot extend to itself".to_owned(),

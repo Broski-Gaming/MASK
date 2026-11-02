@@ -28,6 +28,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    restore_default_sigpipe();
     let args = Args::parse();
 
     let (directory, problems) = match Directory::load(&args.directory) {
@@ -100,5 +101,16 @@ async fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Exit quietly when stdout is a closed pipe (e.g. `| head`) instead of
+/// panicking with "Broken pipe", like standard command-line tools.
+fn restore_default_sigpipe() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: called once at startup before other threads use signals;
+    // SIG_DFL is always a valid handler for SIGPIPE.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
     }
 }

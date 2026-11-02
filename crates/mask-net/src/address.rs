@@ -136,11 +136,13 @@ impl MorpAddress {
         let mut public_key = [0u8; 32];
         public_key.copy_from_slice(&raw[..32]);
         let version = raw[34];
-        if version != ADDRESS_VERSION {
-            return Err(AddressError::UnsupportedVersion(version));
-        }
+        // Check the checksum first: a typo in the last character changes the
+        // version bits, and should be reported as a typo, not a new version.
         if raw[32..34] != checksum(&public_key, version) {
             return Err(AddressError::BadChecksum);
+        }
+        if version != ADDRESS_VERSION {
+            return Err(AddressError::UnsupportedVersion(version));
         }
         Self::from_public_key(public_key)
     }
@@ -428,5 +430,34 @@ mod tests {
         assert!(is_clearnet_morp_url("https://x.morp./"));
         assert!(!is_clearnet_morp_url("https://example.com/morp"));
         assert!(!is_clearnet_morp_url(&format!("morp://{host}/")));
+    }
+}
+
+#[cfg(test)]
+mod typo_tests {
+    use super::*;
+
+    #[test]
+    fn typo_in_the_last_character_is_reported_as_a_checksum_error() {
+        let id = MorpAddress::from_public_key(
+            ed25519_dalek::SigningKey::from_bytes(&[4; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap()
+        .id();
+        for replacement in ['a', 'b', 'q', '7'] {
+            let mut chars: Vec<char> = id.chars().collect();
+            if chars[55] == replacement {
+                continue;
+            }
+            chars[55] = replacement;
+            let typo: String = chars.into_iter().collect();
+            assert_eq!(
+                MorpAddress::parse_id(&typo),
+                Err(AddressError::BadChecksum),
+                "{typo}"
+            );
+        }
     }
 }

@@ -209,10 +209,61 @@ Specification and threat model: `docs/MORP_HIDDEN_SERVICES.md`.
 **Security status: unreviewed.** All components on one machine; not
 Tor-level anonymity.
 
-## Next
+## v0.5 verification (2026-11-01, before starting v0.6)
 
-Candidates, one at a time:
-- Re-establish lost intro points; encrypt descriptors / blind keys.
-- Authenticated, encrypted relay links (TLS 1.3 or Noise) and fixed-size cells.
-- Guard relays and path rules; more relays.
-- Browser circuit/status panel.
+**Result: v0.5 passes.** Starting point: commit `4ab2012`, clean tree.
+
+| # | Check | Evidence | Result |
+|---|---|---|---|
+| 1 | `.morp` addresses generated and validated | Unit tests incl. known-answer vector (cross-checked independently in v0.4); live: `create` (key mode 600), `check` accepts valid, rejects one-character typo, uppercase, short input | Pass |
+| 2 | Browser loads `.morp` sites through relays | Browser handler tests on a live relay network (HTML, CSS, JS, SVG); live run: "MORP session established"; page fetched through relays (HTTP 200, 422 bytes) | Pass |
+| 3 | Separate client and service circuits joined at a rendezvous relay | Integration tests (`rendezvous_joins_…`: 2 joined circuits, 2 created separately, cookie consumed); live relay log: rendezvous1 joined client circuit 2682782509 with service circuit 1395799788, intro via rendezvous2; entry created 5 circuits (2 intro, client rendezvous, client intro, service rendezvous) | Pass |
+| 4 | No direct browser-to-service connections | Deny-by-default connection-policy tests; live `ss`: browser's only TCP connections were to the entry relay (7101) and the directory (7200); only `mask-service` connected to its local app | Pass |
+| 5 | Disconnected or malicious relays fail safely | Tests: missing middle, rendezvous relay shutdown, stopped service, directory down, lying directory, replayed/tampered introductions, unknown intro key, reused cookie, tampered cells, impostor relays, stale onion keys. **New:** `tests/malicious_relays.rs` puts a hostile proxy in front of each rendezvous relay; tampering and black-holing both make requests fail with no request reaching the service and no off-route connection (verified the test fails when the proxy does not attack). Live: middle stopped → host withdrew its descriptor, client got "no service is currently published"; rendezvous relays stopped → "MORP relays unavailable" | Pass |
+| 6 | `cargo fmt`, `cargo check`, `cargo test --workspace` | fmt clean; check clean; clippy clean; **141 tests passed, 0 failed** (19 browser, 74 network unit, 28 MORP, 17 hidden-service, 3 malicious-relay); network suites stable over 8 repeated runs | Pass |
+
+**Changes made during verification**
+- Relays: optional `advertise` address (published in the descriptor;
+  loopback-only for now). Needed for the malicious-proxy tests and for v0.6
+  machines behind port forwarding. Self-extension check also compares the
+  advertised address.
+- `tests/malicious_relays.rs` (3 tests).
+- Address validation: a typo in the last character (which carries the
+  version bits) is now reported as a checksum error instead of
+  "unsupported address version 0". Derivation is unchanged; existing
+  addresses stay valid. Regression test added.
+- `mask-service` / `mask-client`: exit quietly on a closed pipe
+  (`… | head`) instead of panicking with "Broken pipe".
+
+**Unfinished features**
+- Hosts do not re-establish lost introduction points (they withdraw and
+  exit); no automatic restart.
+- No connection reuse or keepalives beyond keeping links with circuits open.
+- GET/HEAD only; no request bodies; 16 MiB response cap.
+- Directory lookups are not routed through circuits.
+- No browser circuit/status panel; no tabs.
+- Everything runs on one machine (loopback only).
+
+**Security limitations (unchanged by verification)**
+- Relay links are plain TCP: observers see cell sizes, timing, circuit IDs;
+  roles in the link handshake are self-declared; `Destroy` is unauthenticated.
+- Variable-size cells; no padding or cover traffic.
+- Single in-memory service directory sees every lookup; descriptors are
+  signed but not encrypted.
+- Relay discovery is a shared local folder, trusted completely.
+- No guards, families, or path diversity; one operator runs every relay.
+- No independent review, formal analysis, or fuzzing. Not anonymous.
+
+**Observations still open from v0.5**
+- Temporary blank WebKit rendering seen once on this machine (also with the
+  v0.4 binary); not seen during this verification.
+- One unreproduced "Service identity could not be verified" under XWayland;
+  the browser now logs exact errors.
+
+## Next: v0.6 — distributed relays (plan)
+
+See `docs/V0.6_PLAN.md`: private-network scope (no public addresses),
+TOML configs, Noise-authenticated links bound to relay identities, directory
+authorities with signed threshold consensus and a relay allowlist,
+cross-machine path rules and guards, intro point re-establishment, and a
+documented LAN trial on 2–5 machines. Not started.

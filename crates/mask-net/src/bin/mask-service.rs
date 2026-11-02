@@ -87,6 +87,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    restore_default_sigpipe();
     let args = Args::parse();
     let result = match args.command {
         Command::Create => create(&args.services_dir),
@@ -359,4 +360,15 @@ async fn fetch_page(args: &Args, address: &str, path: &str) -> Result<(), String
     std::io::stdout()
         .write_all(&response.body)
         .map_err(|e| e.to_string())
+}
+
+/// Exit quietly when stdout is a closed pipe (e.g. `| head`) instead of
+/// panicking with "Broken pipe", like standard command-line tools.
+fn restore_default_sigpipe() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: called once at startup before other threads use signals;
+    // SIG_DFL is always a valid handler for SIGPIPE.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
 }

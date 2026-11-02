@@ -197,8 +197,9 @@ crates/mask-net/           network (no GUI dependencies)
     bin/                   mask-relay, mask-client, mask-service, mask-directory
   tests/morp.rs            relay routing, failure, and tampering tests
   tests/hidden_services.rs hidden-service routing, no-bypass, auth, failure, cleanup tests
+  tests/malicious_relays.rs on-path tampering and black-holing relay tests
 examples/morp-site/        example website
-docs/                      MORP, addresses, hidden services, progress notes
+docs/                      MORP, addresses, hidden services, v0.6 plan, progress notes
 ```
 
 ## Troubleshooting
