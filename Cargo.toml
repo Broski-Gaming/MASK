@@ -1,9 +1,15 @@
+[workspace]
+members = [".", "crates/mask-net"]
+default-members = [".", "crates/mask-net"]
+resolver = "3"
+
 [package]
 name = "mask"
 version = "0.1.0"
 edition = "2024"
 description = "MASK (Multi-hop Anonymous Service Kit): experimental privacy browser and onion-routing network"
 publish = false
+default-run = "mask-browser"
 
 [[bin]]
 name = "mask-browser"
