@@ -10,6 +10,8 @@ use std::error::Error;
 
 use gtk::glib;
 use gtk::prelude::*;
+use mask_net::address::is_clearnet_morp_url;
+use mask_net::service::fetch::FetchTimeouts;
 use webkit2gtk::WebViewExt;
 use wry::{WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
 
@@ -17,13 +19,28 @@ use crate::address::{display_text, parse_address};
 
 pub const WINDOW_TITLE: &str = "MASK Browser";
 
-/// Honest description of the current connection, shown in the toolbar.
-const CONNECTION_STATUS: &str = "Direct connection · not anonymous";
+/// Honest descriptions of the current connection, shown in the toolbar.
+const WEB_STATUS: &str = "Direct connection · not anonymous";
+const WEB_TOOLTIP: &str = "Websites are loaded directly. They see your real IP address.";
+const MORP_STATUS: &str = "MORP service · localhost prototype · not anonymous";
+const MORP_TOOLTIP: &str = "Resolved through the local MORP directory (no DNS). The service \
+    must prove it owns this .morp address. v0.4 connects directly over localhost: relays are \
+    not used and the service's location is not hidden.";
 
 /// Build the window and run the GTK main loop until it is closed.
-pub fn run() -> Result<(), Box<dyn Error>> {
+/// `initial` is an optional address to open, validated like address bar input.
+pub fn run(initial: Option<&str>) -> Result<(), Box<dyn Error>> {
     gtk::init()?;
     theme::apply()?;
+
+    // Background threads for morp:// requests, so the UI never blocks.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("mask-morp")
+        .enable_all()
+        .build()?;
+    let morp_runtime = runtime.handle().clone();
+    let directory = crate::morp::directory_client()?;
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(WINDOW_TITLE);
@@ -41,12 +58,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let address = gtk::Entry::new();
     address.style_context().add_class("mask-address");
     address.set_hexpand(true);
-    address.set_placeholder_text(Some("Enter an address, e.g. example.com"));
-    let status = gtk::Label::new(Some(CONNECTION_STATUS));
+    address.set_placeholder_text(Some("Enter https://… or a morp://<id>.morp address"));
+    let status = gtk::Label::new(Some(WEB_STATUS));
     status.style_context().add_class("mask-status");
-    status.set_tooltip_text(Some(
-        "MASK 0.1 has no onion routing. Websites see your real IP address.",
-    ));
+    status.set_tooltip_text(Some(WEB_TOOLTIP));
     toolbar.pack_start(&back, false, false, 0);
     toolbar.pack_start(&forward, false, false, 0);
     toolbar.pack_start(&reload, false, false, 0);
@@ -66,6 +81,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let wry_view = WebViewBuilder::new()
         // Ephemeral session: cookies, cache and storage are discarded on exit.
         .with_incognito(true)
+        // morp:// is answered only by the MORP handler: directory lookup,
+        // identity proof, then the page, or a local error page. Never DNS.
+        .with_asynchronous_custom_protocol("morp".into(), move |_id, request, responder| {
+            let method = request.method().as_str().to_owned();
+            let uri = request.uri().to_string();
+            let directory = directory.clone();
+            morp_runtime.spawn(async move {
+                let response =
+                    crate::morp::handle(&directory, &method, &uri, FetchTimeouts::default()).await;
+                responder.respond(response);
+            });
+        })
+        // Block any http(s) navigation to a .morp name (e.g. a link on a
+        // website): it would leak the name to public DNS.
+        .with_navigation_handler(|url| !is_clearnet_morp_url(&url))
         .with_html(start_page::HTML)
         .build_gtk(&content)?;
     let view = wry_view.webview();
@@ -92,9 +122,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }));
 
     // Keep the address bar in sync with the page, including link clicks.
-    view.connect_uri_notify(glib::clone!(@weak address => move |view| {
+    view.connect_uri_notify(glib::clone!(@weak address, @weak status => move |view| {
         let uri = view.uri().unwrap_or_default();
         address.set_text(display_text(&uri));
+        let (text, tooltip) = if uri.starts_with("morp://") {
+            (MORP_STATUS, MORP_TOOLTIP)
+        } else {
+            (WEB_STATUS, WEB_TOOLTIP)
+        };
+        status.set_text(text);
+        status.set_tooltip_text(Some(tooltip));
     }));
 
     view.connect_title_notify(glib::clone!(@weak window => move |view| {
@@ -112,10 +149,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     notice.hide();
     address.grab_focus();
 
+    if let Some(initial) = initial {
+        address.set_text(initial);
+        address.emit_activate();
+    }
+
     gtk::main();
 
-    // The wry WebView must stay alive for as long as the window is shown.
+    // The wry WebView and the runtime must live as long as the window.
     drop(wry_view);
+    runtime.shutdown_background();
     Ok(())
 }
 

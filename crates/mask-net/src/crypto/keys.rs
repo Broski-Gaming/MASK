@@ -40,48 +40,11 @@ impl RelayKeys {
     ///
     /// Refuses to use a key file readable by group or others.
     pub fn load_or_create(data_dir: &Path) -> io::Result<Self> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(data_dir)?;
+        create_private_dir(data_dir, true)?;
         let path = data_dir.join(IDENTITY_FILE);
-
-        let seed = match OpenOptions::new().read(true).open(&path) {
-            Ok(mut file) => {
-                let mode = file.metadata()?.permissions().mode();
-                if mode & 0o077 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "{} is accessible by other users (mode {:o}); run: chmod 600 {}",
-                            path.display(),
-                            mode & 0o777,
-                            path.display()
-                        ),
-                    ));
-                }
-                let mut seed = Zeroizing::new([0u8; 32]);
-                let mut extra = [0u8; 1];
-                file.read_exact(seed.as_mut())?;
-                if file.read(&mut extra)? != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} is not a 32-byte key", path.display()),
-                    ));
-                }
-                seed
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let seed = Zeroizing::new(random_bytes::<32>());
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)?;
-                file.write_all(seed.as_ref())?;
-                file.sync_all()?;
-                seed
-            }
+        let seed = match read_secret(&path) {
+            Ok(seed) => seed,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => write_new_secret(&path)?,
             Err(e) => return Err(e),
         };
 
@@ -111,6 +74,71 @@ impl RelayKeys {
 /// Where the identity key for `data_dir` is stored.
 pub fn identity_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(IDENTITY_FILE)
+}
+
+// ------------------------------------------------- secret key files
+// Shared by relay identity keys and service keys.
+
+/// Create `dir` with mode 0700. With `allow_existing`, an existing directory
+/// is accepted (its mode is left unchanged).
+pub(crate) fn create_private_dir(dir: &Path, allow_existing: bool) -> io::Result<()> {
+    if allow_existing {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    } else {
+        if let Some(parent) = dir.parent() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        DirBuilder::new().mode(0o700).create(dir)
+    }
+}
+
+/// Read a 32-byte secret, refusing files that group or others can access.
+pub(crate) fn read_secret(path: &Path) -> io::Result<Zeroizing<[u8; 32]>> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mode = file.metadata()?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is accessible by other users (mode {:o}); run: chmod 600 {}",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            ),
+        ));
+    }
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let mut extra = [0u8; 1];
+    file.read_exact(seed.as_mut())?;
+    if file.read(&mut extra)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a 32-byte key", path.display()),
+        ));
+    }
+    Ok(seed)
+}
+
+/// Generate a random 32-byte secret and write it to a new file with mode
+/// 0600. Fails if the file already exists.
+pub(crate) fn write_new_secret(path: &Path) -> io::Result<Zeroizing<[u8; 32]>> {
+    let seed = Zeroizing::new(random_bytes::<32>());
+    write_secret(path, &seed)?;
+    Ok(seed)
+}
+
+/// Write `secret` to a new file with mode 0600. Fails if the file exists.
+pub(crate) fn write_secret(path: &Path, secret: &[u8; 32]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(secret)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

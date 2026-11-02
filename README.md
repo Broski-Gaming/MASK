@@ -2,20 +2,39 @@
 
 An experimental privacy browser and onion-routing network, written in Rust.
 
-> **Status: v0.3 development build. MASK is not anonymous and has not been
-> security reviewed.** The browser connects directly to websites over your
-> normal internet connection and does not use the relay network yet. The
-> relay network (MORP) runs only on localhost and is an unreviewed
-> experiment. Do not rely on MASK for privacy or safety.
+> **Status: v0.4 development build. MASK is not anonymous and has not been
+> security reviewed.** Websites are loaded directly over your normal internet
+> connection. The relay network (MORP) and `.morp` services run only on
+> localhost. `.morp` addresses prove a service's identity but, in this
+> version, do **not** hide where it runs. Do not rely on MASK for privacy or
+> safety.
 
 ## What works
 
-**Browser (v0.1)**
+**Browser**
 - MASK Browser window (GTK3 + WebKitGTK via [Wry](https://github.com/tauri-apps/wry))
 - Dark interface with back, forward, reload, and an address bar
 - Opens `https://` and `http://` websites; bare domains default to `https://`
-- Rejects other schemes (`file:`, `javascript:`, `data:`, ...)
+- Opens cryptographic `morp://<id>.morp` services (see below)
+- Rejects other schemes (`file:`, `javascript:`, `data:`, ...) and named `.mask` addresses
 - Ephemeral session: cookies, cache, and site storage are discarded on exit
+
+**`.morp` services (v0.4, direct localhost prototype)**
+
+MASK supports **only cryptographic `.morp` addresses**: a service's address
+is derived from its Ed25519 public key. There are no names, aliases, or DNS.
+Specification, threat model, and limitations:
+[docs/MORP_ADDRESSES.md](docs/MORP_ADDRESSES.md).
+
+- `mask-service create` generates an identity and its 56-character address
+- Addresses carry a SHA3-256 checksum and version; typos are rejected
+- Private keys stored with mode 0600 in `runtime/services/<id>/`
+- Signed, expiring service descriptors in a localhost directory (`mask-directory`)
+- The service proves it owns its address on every connection; traffic is encrypted
+- Static websites (HTML, CSS, JavaScript, images) open in MASK Browser
+- No DNS, no clearnet fallback; failures show local error pages
+- **Not hidden:** the browser connects directly to the service on 127.0.0.1;
+  relays are not used yet (introduction points and rendezvous circuits: v0.5)
 
 **Relay network — MORP v1 (v0.3, localhost prototype)**
 
@@ -87,6 +106,41 @@ Default ports: entry `127.0.0.1:7101`, middle `7102`, exit `7103`
 (change with `--listen 127.0.0.1:PORT`).
 More detail in the logs: add `RUST_LOG=debug` before `cargo run`.
 
+## Host and open a `.morp` website
+
+Open **three Konsole tabs** in the project folder.
+
+```sh
+# Tab 1: the localhost service directory
+cargo run -p mask-net --bin mask-directory
+
+# Tab 2: create an identity (once) and host the example site
+cargo run -p mask-net --bin mask-service -- create
+#   → prints: Address: morp://<56 characters>.morp/
+cargo run -p mask-net --bin mask-service -- host <address> --site examples/morp-site
+
+# Tab 3: open it in MASK Browser (or type the address in the address bar)
+cargo run -- morp://<56 characters>.morp/
+```
+
+Other commands:
+
+```sh
+cargo run -p mask-net --bin mask-service -- list              # your services
+cargo run -p mask-net --bin mask-service -- show <address>    # details
+cargo run -p mask-net --bin mask-service -- check <address>   # validate offline
+cargo run -p mask-net --bin mask-service -- verify <address>  # directory + live identity proof
+cargo run -p mask-net --bin mask-service -- stop <address>    # stop a running host
+```
+
+- The address is generated from the key and can never be chosen or changed.
+  Keep `runtime/services/<id>/service.key` private and backed up; it **is**
+  the service. `runtime/` is git-ignored: never commit it.
+- Stopping a host (Ctrl+C or `stop`) withdraws its descriptor, so browsers
+  show "Service not found".
+- The directory keeps descriptors in memory; if you restart it, restart
+  your hosts too.
+
 ## Development checks
 
 ```sh
@@ -104,12 +158,16 @@ src/                       browser
   main.rs                  entry point
   lib.rs                   crate root
   address.rs               address bar parsing and validation
+  morp.rs                  morp:// protocol handler (no DNS, fails closed)
   browser/
     mod.rs                 window, toolbar, and web view
     theme.rs               dark GTK styling
     start_page.rs          built-in start page
-crates/mask-net/           relay network: MORP (no GUI dependencies)
+crates/mask-net/           network: MORP relays + .morp services (no GUI deps)
   src/
+    address.rs             .morp address format and validation
+    service/               service keys, descriptors, channel, site hosting, fetch
+    directory/             localhost service directory (server + client)
     crypto/keys.rs         Ed25519 identity + X25519 onion keys, key file
     crypto/ntor.rs         ntor-style handshake
     crypto/onion.rs        per-hop ChaCha20-Poly1305 with counter nonces
@@ -121,8 +179,13 @@ crates/mask-net/           relay network: MORP (no GUI dependencies)
     client.rs              circuit building and layered encryption
     bin/mask-relay.rs      relay command
     bin/mask-client.rs     test client command
+    bin/mask-service.rs    create / host / stop / verify .morp services
+    bin/mask-directory.rs  service directory command
   tests/morp.rs            end-to-end routing, failure, and tampering tests
+  tests/services.rs        .morp directory, hosting, identity, failure tests
+examples/morp-site/        example website for a .morp service
 docs/MORP.md               MORP specification, threat model, limitations
+docs/MORP_ADDRESSES.md     .morp address and service specification, threat model
 docs/PROGRESS.md           milestone progress notes
 ```
 
@@ -145,3 +208,9 @@ descriptor, or delete the stale `.json` file.
 
 If a relay refuses to start because `identity.key` is accessible by other
 users, fix the permissions with `chmod 600 runtime/relays/<name>/identity.key`.
+
+If MASK Browser shows **"MORP directory unavailable"**, start
+`mask-directory`. **"Service not found"** means no host is currently
+publishing that address. **"Service identity could not be verified"** means
+something answered at the published endpoint without the address's private
+key; nothing from it was displayed.

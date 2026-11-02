@@ -1,16 +1,17 @@
-//! MASK — Multi-hop Anonymous Service Kit.
+//! MASK — Multi-hop Anonymous Service Kit: the browser.
 //!
-//! Version 0.1 contains only the browser shell. Pages are loaded over the
-//! normal, direct internet connection: there is no onion routing yet and
-//! MASK does not provide anonymity.
+//! **Not anonymous.** Normal websites are loaded over the direct internet
+//! connection. `.morp` services are resolved through the local MORP
+//! directory and reached over an authenticated, encrypted localhost
+//! connection (v0.4 prototype: not through relays, location not hidden).
 //!
 //! Module layout:
 //! - [`address`]: parses and validates what the user types in the address bar.
+//! - [`morp`]: the `morp://` protocol handler (no DNS, no clearnet fallback).
 //! - [`browser`]: the GTK window, toolbar, and embedded WebKit view.
 //!
-//! Future networking code (relays, circuits, SOCKS5, `.mask` services) will
-//! live in its own modules and plug into the browser through the address and
-//! connection layers rather than the UI code.
+//! Networking lives in the separate `mask-net` crate.
 
 pub mod address;
 pub mod browser;
+pub mod morp;

@@ -1,0 +1,15 @@
+html, body { height: 100%; margin: 0; }
+body {
+  background: #0f1117;
+  color: #c9d1d9;
+  font-family: system-ui, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+main { max-width: 640px; padding: 32px; text-align: center; }
+h1 { color: #e6edf3; }
+code { color: #8b6cff; }
+.pending { color: #e3b341; }
+.ok { color: #56d364; }
+.note { color: #8b949e; font-size: 14px; }

@@ -33,12 +33,14 @@ pub const HTML: &str = r#"<!DOCTYPE html>
 <body>
 <main>
   <h1>MASK</h1>
-  <p class="version">Multi-hop Anonymous Service Kit · v0.1 development build</p>
-  <p>Type an address in the bar above to open a website.</p>
+  <p class="version">Multi-hop Anonymous Service Kit · v0.4 development build</p>
+  <p>Type a website (<code>https://…</code>) or a cryptographic <code>morp://&lt;id&gt;.morp</code> address above.</p>
   <div class="warning">
-    <strong>Not anonymous.</strong> This build connects directly to websites over
-    your normal internet connection. Onion routing and <code>.mask</code> services
-    are not implemented yet. Cookies and site data are discarded when the window closes.
+    <strong>Not anonymous.</strong> Websites are loaded directly over your normal
+    internet connection. <code>.morp</code> services are found through the local MORP
+    directory (never public DNS) and must prove they own their address, but this
+    prototype connects to them directly on localhost: their location is not hidden
+    and no relays are used. Cookies and site data are discarded when the window closes.
   </div>
 </main>
 </body>

@@ -1,6 +1,6 @@
 [package]
 name = "mask-net"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "MASK relay network: protocol, relays, and test client (experimental, NOT anonymous)"
 publish = false
@@ -12,6 +12,14 @@ path = "src/bin/mask-relay.rs"
 [[bin]]
 name = "mask-client"
 path = "src/bin/mask-client.rs"
+
+[[bin]]
+name = "mask-service"
+path = "src/bin/mask-service.rs"
+
+[[bin]]
+name = "mask-directory"
+path = "src/bin/mask-directory.rs"
 
 [dependencies]
 tokio = { version = "1.54.1", features = ["full"] }
@@ -32,6 +40,15 @@ hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"
 zeroize = { version = "1.9", features = ["derive"] }
+sha3 = "0.12"
+data-encoding = "2.11"
+# Service directory (HTTP on 127.0.0.1 only). reqwest without default features:
+# no TLS and no system proxy, so lookups can never leave the machine via a proxy.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+reqwest = { version = "0.13", default-features = false }
+url = "2.5"
+percent-encoding = "2.3"
+nix = { version = "0.31", features = ["signal"] }
 
 [dev-dependencies]
 tempfile = "3"

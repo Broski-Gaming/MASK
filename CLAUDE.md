@@ -30,7 +30,7 @@ MASK will eventually support:
 - Entry, middle, and exit relay nodes
 - SOCKS5 proxy connections
 - Independent relay identities
-- Private `.mask` addresses
+- Private cryptographic `.morp` addresses (see "Service Addresses" below)
 - Cryptographically generated service identities
 - Hidden websites hosted by MASK users
 - Introduction points and rendezvous circuits
@@ -39,7 +39,7 @@ MASK will eventually support:
 - Custom dark interface
 - Tabs and address bar
 - Normal HTTPS website browsing
-- `.mask` website browsing
+- `.morp` website browsing (cryptographic addresses only)
 - Network connection status
 - Relay and circuit information
 - Privacy settings
@@ -58,12 +58,24 @@ Network protocol: **MORP** (MASK Onion Routing Protocol). Full spec, threat mode
 - Relays only bind to and extend to loopback addresses until the network is ready to leave localhost.
 - Crypto rule: use established primitives from RustCrypto/dalek only; never invent cryptographic algorithms.
 
+## Service Addresses (decision, v0.4)
+**MASK exclusively supports cryptographic `.morp` service addresses.** This is a permanent design decision:
+- An address is `morp://<56-char id>.morp/`, where the id is lowercase Base32 of `Ed25519 public key (32) || SHA3-256("MORP address checksum v1" || key || version)[..2] || version 0x01`. Spec: `docs/MORP_ADDRESSES.md`.
+- Never add friendly names, aliases, nicknames, DNS records, registrars, petnames, or manually chosen/registered service names. Never allow an address to be reassigned to another key.
+- `.morp` names must never be resolved through public DNS or sent over `http(s)`; `morp://` is served only by the browser's custom protocol handler via the MORP directory, failing closed with a local error page.
+- `.mask` and other named schemes are rejected.
+- Service keys live in `runtime/services/<id>/service.key` (0600, folder 0700, folder named by the address). The directory never stores private keys.
+- v0.4 hosting is a **direct localhost prototype**: descriptors contain the real loopback endpoint, so service location is NOT hidden. Never claim `.morp` addresses hide server IPs until introduction points / rendezvous circuits (v0.5) exist and are reviewed.
+
+Components: `mask-service` (create/list/show/check/host/stop/verify), `mask-directory` (Axum, 127.0.0.1:7200), `src/morp.rs` (browser handler). The relay directory (`runtime/directory/`, files) and the service directory (HTTP) are separate.
+
 ## Milestones
 - [x] v0.1 — Browser window: dark GTK UI, address bar, HTTPS browsing, ephemeral session.
 - [x] v0.2 — Relay network foundation: entry/middle/exit relays on 127.0.0.1, framed structured messages, plaintext onion layers, error propagation, logging, tests.
 - [x] v0.3 — MORP v1: Ed25519 relay identities, signed descriptors, ntor-style handshakes, layered ChaCha20-Poly1305 with replay protection, circuit IDs, encrypted replies, tests. Unreviewed.
-- [ ] Next candidates: TLS/Noise-encrypted links and fixed-size cells; SOCKS5 proxy and real exit streams; connecting the browser to the network.
-- [ ] Later: `.mask` hidden services (introduction points, rendezvous circuits).
+- [x] v0.4 — Cryptographic `.morp` addresses: Ed25519 service identities, signed expiring descriptors, localhost directory, authenticated encrypted service channel, static site hosting, `morp://` in MASK Browser with no DNS/clearnet fallback. Direct localhost prototype (location not hidden). Unreviewed.
+- [ ] v0.5: hidden-service circuits for `.morp` (introduction points, rendezvous circuits over MORP relays).
+- [ ] Other candidates: TLS/Noise-encrypted links and fixed-size cells; SOCKS5 proxy and real exit streams; browser network/circuit status panel.
 
 ## Project Documentation
 
