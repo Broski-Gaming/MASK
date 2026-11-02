@@ -19,7 +19,7 @@ use crate::crypto::ntor::{CreateReply, CreateRequest};
 use crate::identity::Role;
 
 /// MORP protocol version, checked in the link handshake.
-pub const MORP_VERSION: u16 = 1;
+pub const MORP_VERSION: u16 = 2;
 
 /// Largest frame accepted on any link.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
@@ -102,6 +102,38 @@ pub enum RelayCmd {
     Data { bytes: Vec<u8> },
     /// Hop → client: a command failed. The circuit stays open.
     Error { code: ErrorCode, detail: String },
+
+    // ---- Hidden services (rendezvous-role relays only; see docs/MORP_HIDDEN_SERVICES.md)
+    /// Service → intro point: accept introductions for `auth_key`. Signed
+    /// by the per-intro auth key (never the service identity key).
+    EstablishIntro {
+        auth_key: [u8; 32],
+        signature: Vec<u8>,
+    },
+    /// Intro point → service.
+    IntroEstablished,
+    /// Client → intro point: deliver `payload` (encrypted to the service)
+    /// to the service registered under `auth_key`.
+    Introduce1 {
+        auth_key: [u8; 32],
+        payload: Vec<u8>,
+    },
+    /// Intro point → client: the introduction was forwarded.
+    IntroduceAck,
+    /// Intro point → service: an introduction from some client.
+    Introduce2 { payload: Vec<u8> },
+    /// Client → rendezvous point: wait for a service presenting `cookie`.
+    EstablishRendezvous { cookie: [u8; 32] },
+    /// Rendezvous point → client.
+    RendezvousEstablished,
+    /// Service → rendezvous point: join me to the circuit waiting with
+    /// `cookie`, and pass `payload` (the handshake reply) to it.
+    Rendezvous1 { cookie: [u8; 32], payload: Vec<u8> },
+    /// Rendezvous point → client: the service's handshake reply.
+    Rendezvous2 { payload: Vec<u8> },
+    /// End-to-end encrypted data between client and service, passed
+    /// unchanged (and unreadable) by the rendezvous point.
+    Stream { bytes: Vec<u8> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +144,14 @@ pub enum ErrorCode {
     /// The command is not allowed at this hop.
     NotAllowed,
     Timeout,
+    /// The intro point has no service registered under that auth key.
+    UnknownService,
+    /// Unknown, expired, or already used rendezvous cookie.
+    BadCookie,
+    /// A hidden-service request was malformed or badly signed.
+    Rejected,
+    /// A relay limit was reached.
+    ResourceLimit,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {

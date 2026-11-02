@@ -1522,13 +1522,15 @@ dependencies = [
 
 [[package]]
 name = "mask"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "gtk",
  "http",
  "mask-net",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "webkit2gtk",
  "wry",
@@ -1536,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "mask-net"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "chacha20poly1305",

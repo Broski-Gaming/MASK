@@ -1,11 +1,10 @@
-# MORP Addresses and Services (v0.4, experimental)
+# MORP Addresses and Services (v0.5, experimental)
 
 > **Status: experimental, unreviewed, localhost only.**
-> In v0.4 a `.morp` address proves *who* a service is, not *where* it is.
-> Services are reached over a direct localhost connection; their location
-> is **not hidden** and MASK is **not anonymous**. Introduction points and
-> rendezvous circuits (which hide the service's location) are planned for
-> v0.5.
+> A `.morp` address proves *who* a service is. Since v0.5, services are
+> reached only through MORP relay circuits and descriptors carry no location
+> (see `docs/MORP_HIDDEN_SERVICES.md`). This is **not** Tor-level anonymity
+> and has not been independently reviewed.
 
 MASK supports **only cryptographic `.morp` addresses** for services. There
 are no friendly names, aliases, DNS records, registrars, or manually chosen
@@ -72,14 +71,17 @@ a folder whose name is not the address of the key inside it.
 **The key is the identity.** Anyone with `service.key` can impersonate the
 service; losing it loses the address forever. `runtime/` is git-ignored.
 
-## 3. Service descriptors
+## 3. Service descriptors (version 2)
 
-A descriptor tells clients how to reach a service:
+A descriptor tells clients how to introduce themselves to a service. Since
+v0.5 it lists **introduction points only** and contains no IP address, port,
+or other location:
 
 ```
 signature = Ed25519-Sign(service key,
-    "MORP-v1 service descriptor\0" ||
-    postcard(version=1, public_key, revision, published, expires, endpoint))
+    "MORP-v2 service descriptor\0" ||
+    postcard(version=2, public_key, revision, published, expires, intro_points))
+intro_point = (relay identity, intro auth key (Ed25519), intro encryption key (X25519))
 ```
 
 | Field | Meaning |
@@ -87,15 +89,19 @@ signature = Ed25519-Sign(service key,
 | `address` | The `.morp` host; contains the public key that must verify the signature. |
 | `revision` | Strictly increasing (milliseconds since epoch at signing). |
 | `published`, `expires` | Validity window, at most 3 hours; hosts republish every third of it (default lifetime 1 hour). |
-| `endpoint` | v0.4: `DirectLoopback(127.0.0.1:port)` — the service's **real** location. |
+| `intro_points` | 1–3 entries; distinct relays; valid, non-weak auth keys. |
 
 A descriptor is accepted only if the signature verifies with the key inside
 its own address, it is not expired, not dated more than 5 minutes in the
-future, its lifetime is ≤ 3 hours, and the endpoint is a loopback address.
+future, its lifetime is ≤ 3 hours, and its intro points are well formed.
 Because the key is the address, a descriptor can never reassign an address
-to another key.
+to another key. Clients find each intro relay's network address and onion
+key in the relay directory by its identity.
 
 **Withdrawal:** `Ed25519-Sign(key, "MORP-v1 service withdrawal\0" || public_key || revision)`.
+
+The v0.4 `DirectLoopback` endpoint and the direct client-to-service channel
+were **removed** in v0.5.
 
 ## 4. Directory (`mask-directory`)
 
@@ -105,49 +111,33 @@ descriptors held in memory.
 | Request | Behaviour |
 |---|---|
 | `GET /v1/services/{id}` | Re-verifies, then returns the descriptor; drops it if expired. 404 if none. |
-| `PUT /v1/services/{id}` | 400 malformed or `{id}` ≠ descriptor address; 422 bad signature / expired / not yet valid / non-loopback; 409 revision not newer than stored or withdrawn; 507 full. |
+| `PUT /v1/services/{id}` | 400 malformed or `{id}` ≠ descriptor address; 422 bad signature / expired / not yet valid / bad intro points; 409 revision not newer than stored or withdrawn; 507 full. |
 | `DELETE /v1/services/{id}` | Requires a valid signed withdrawal at least as new as the stored revision; remembers the revision so the old descriptor cannot be replayed. |
 
 There is **no** endpoint that lists services, registers names, or stores
 keys. Body size is capped at 8 KiB. Clients verify every descriptor
 themselves; the directory is not trusted for authenticity.
 
-## 5. Service channel
+## 5. Reaching a service
 
-Clients connect to the descriptor's endpoint and run a signed ephemeral
-Diffie-Hellman handshake (the server-authentication pattern of TLS 1.3 /
-SIGMA):
-
-```
-client → service: ClientHello { version, service public key, X = x·G }
-service:          refuse unless the key is its own
-service → client: ServerHello { Y = y·G, Ed25519-Sign(key, DOMAIN || key || X || Y) }
-client:           verify with the key inside the .morp address
-both:             c2s || s2c = HKDF-SHA256(salt = DOMAIN, ikm = x·Y,
-                                           info = "MORP-v1 service channel keys" || key || X || Y)
-```
-
-Afterwards all requests and responses are sealed with ChaCha20-Poly1305
-using the same counter-nonce scheme as MORP cells (tampering, replay, and
-reordering are detected). Responses are sent as a head plus 32 KiB body
-chunks; clients accept at most 16 MiB.
-
-This proves, **on every connection**, that the server holds the address's
-private key. A process that takes over a stopped service's port, or a
-descriptor pointing at the wrong place, is detected (tested).
+Since v0.5, `.morp` services are reached **only through MORP relay
+circuits**: introduction points, a rendezvous point, and an end-to-end
+encrypted session in which the service proves possession of the address's
+private key. See `docs/MORP_HIDDEN_SERVICES.md`.
 
 ## 6. Hosting
 
 ```
-mask-service host <address> --site <folder>
+mask-service host <address> --site <folder>          # built-in static app
+mask-service host <address> --app 127.0.0.1:PORT     # your own loopback app
 ```
 
-Serves static files (HTML, CSS, JS, images, fonts, …) by GET only. Path
-handling: percent-decoding, `..` refused, hidden files not served, NUL and
-backslash refused, final path canonicalised and required to stay inside the
-site folder (symlinks cannot escape). The host publishes its descriptor,
+The host establishes introduction points, publishes the descriptor,
 refreshes it, and withdraws it on Ctrl+C or `mask-service stop <address>`.
-Logs record status codes and sizes, not paths.
+The built-in static server: GET/HEAD only, percent-decoding, `..` refused,
+hidden files not served, NUL and backslash refused, final path canonicalised
+and required to stay inside the site folder (symlinks cannot escape). It
+listens on 127.0.0.1 only and is contacted only by the host itself.
 
 ## 7. Browser integration
 
@@ -155,11 +145,12 @@ Logs record status codes and sizes, not paths.
 (`with_asynchronous_custom_protocol`):
 
 1. Validate the address. Invalid → error, nothing contacted.
-2. Look it up in the local directory. Never DNS.
-3. Verify the descriptor.
-4. Open the service channel and check the identity proof.
-5. Fetch the path; return the page, or a local error page (not found,
-   unavailable, identity failure, directory down).
+2. Look it up in the local directory (never DNS) and verify the descriptor.
+3. Build relay circuits, introduce, rendezvous, and verify the service's
+   identity proof.
+4. Fetch the page and all its resources over the end-to-end session; return
+   them, or a local error page (not found, circuit failed, unavailable,
+   identity failure, directory down, timeout).
 
 Safety rules:
 - Typing `<id>.morp` opens `morp://<id>.morp/`.
@@ -175,35 +166,29 @@ Safety rules:
 
 ---
 
-## 8. Threat model
+## 8. Threat model (addresses and directory)
 
-### What v0.4 protects against
+The hidden-service threat model is in `docs/MORP_HIDDEN_SERVICES.md`. For the
+address and directory layer:
+
+### Protected against
 
 | Threat | Protection |
 |---|---|
 | Typos and corrupted addresses | Checksum, version, and key validation before any lookup. |
-| Someone claiming an address they do not own | Descriptors and the channel handshake must be signed by the address's own key. |
-| A malicious or compromised directory serving a fake descriptor | Clients verify signatures themselves; a fake descriptor fails. |
-| A process squatting a stopped service's port | The channel handshake fails without the private key. |
+| Someone claiming an address they do not own | Descriptors and the rendezvous handshake must be signed by the address's own key. |
+| A malicious or compromised directory serving a fake descriptor | Clients verify signatures themselves; a fake descriptor fails (tested with a lying directory). |
 | Replay of an old descriptor | Directory requires strictly newer revisions and remembers withdrawals; descriptors expire within 3 hours. |
-| Tampering with traffic on the local link | Channel traffic is authenticated and encrypted. |
 | `.morp` names leaking to public DNS via navigation | Address bar and navigation handler refuse `http(s)` for `.morp`. |
 | A `.morp` page contacting the internet | Restrictive CSP on every `.morp` response. |
 | Path traversal on the host | Canonicalised paths confined to the site folder. |
 
-### What v0.4 does **not** protect against
+### Not protected against
 
-- **Service location.** The descriptor contains the service's real
-  `127.0.0.1:port`. Anyone who can read the directory learns where the
-  service runs. Cryptographic addresses alone **do not hide server IP
-  addresses**. That is the job of introduction points and rendezvous
-  circuits (v0.5).
-- **Client anonymity.** The browser connects directly; the service sees the
-  connection. Relays are not used for `.morp` traffic yet.
 - **Directory availability and privacy.** The directory can refuse to serve
   descriptors, log which addresses are looked up, and see every published
-  endpoint. It is a single, in-memory, unauthenticated-reader server.
-  Addresses are looked up in plaintext over local HTTP.
+  descriptor (they are signed, not encrypted). It is a single, in-memory
+  server.
 - **Denial of service.** Anyone on the machine can publish many descriptors
   (each needs its own key) or flood the directory.
 - **Stolen service keys.** Whoever holds `service.key` *is* the service.
@@ -214,18 +199,13 @@ Safety rules:
   `https://` pages for `*.morp` hosts are not intercepted; the `.morp` TLD
   does not exist in public DNS, but such a request could still reveal the
   name to a resolver.
-- **Web content risks.** `.morp` pages run JavaScript (restricted to their
-  own origin by CSP). WebKit fingerprinting, timing, and browser exploits are
-  out of scope.
 - **Unreviewed design.** No independent cryptographic or security review,
   fuzzing, or formal analysis has been done.
 
 ## 9. Limitations (implementation)
 
-- Directory is in-memory: restarting it forgets all descriptors (hosts
-  republish within a third of their lifetime, or restart them).
-- One request per channel connection from the browser; no connection reuse.
-- GET only; no request bodies, uploads, or streaming; 16 MiB response cap.
-- No descriptor encryption (Tor v3 encrypts descriptors so the directory
-  cannot read them; MORP v0.4 does not).
+- Directory is in-memory: restarting it forgets all descriptors (restart
+  your hosts).
+- GET/HEAD only; no request bodies, uploads, or streaming; 16 MiB response cap.
+- No descriptor encryption or key blinding.
 - No key backup, rotation, or offline identity keys.

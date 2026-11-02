@@ -65,17 +65,25 @@ Network protocol: **MORP** (MASK Onion Routing Protocol). Full spec, threat mode
 - `.morp` names must never be resolved through public DNS or sent over `http(s)`; `morp://` is served only by the browser's custom protocol handler via the MORP directory, failing closed with a local error page.
 - `.mask` and other named schemes are rejected.
 - Service keys live in `runtime/services/<id>/service.key` (0600, folder 0700, folder named by the address). The directory never stores private keys.
-- v0.4 hosting is a **direct localhost prototype**: descriptors contain the real loopback endpoint, so service location is NOT hidden. Never claim `.morp` addresses hide server IPs until introduction points / rendezvous circuits (v0.5) exist and are reviewed.
+- Since v0.5, `.morp` traffic travels **only** through MORP relay circuits (introduction points + rendezvous). Never add a direct browser-to-service connection, a clearnet/exit path for `.morp`, or any fallback. Descriptors (v2) list intro points only, never a network location.
+- Even so: do not claim Tor-level anonymity or real location hiding. Everything runs on one machine with a handful of relays, and nothing has been independently reviewed.
 
-Components: `mask-service` (create/list/show/check/host/stop/verify), `mask-directory` (Axum, 127.0.0.1:7200), `src/morp.rs` (browser handler). The relay directory (`runtime/directory/`, files) and the service directory (HTTP) are separate.
+Components: `mask-service` (create/list/show/check/host/stop/verify/fetch), `mask-directory` (Axum, 127.0.0.1:7200), `crates/mask-net/src/hs/` (hidden services), `src/morp.rs` (browser handler). The relay directory (`runtime/directory/`, files) and the service directory (HTTP) are separate.
+
+## Hidden Services (v0.5)
+Spec and threat model: `docs/MORP_HIDDEN_SERVICES.md`.
+- Relay role `rendezvous` (last hop after a middle) acts as introduction point and rendezvous point. Exits are never used for `.morp`.
+- Service: per-run intro auth (Ed25519) + intro encryption (X25519) keys per intro point; the identity key never leaves the host. Introductions are encrypted to the service; replays rejected.
+- Client: random rendezvous relay + single-use 32-byte cookie; service builds its own circuit to it; rendezvous joins the circuits; service signs the handshake with its identity key; end-to-end ChaCha20-Poly1305 session with counter nonces, multiplexed requests.
+- Testing rules: prove routing with the `ConnectPolicy` (deny-by-default, records every outbound connection), the relay `Observer` (every plaintext a relay decrypts), and relay/host counters, not log messages.
 
 ## Milestones
 - [x] v0.1 — Browser window: dark GTK UI, address bar, HTTPS browsing, ephemeral session.
 - [x] v0.2 — Relay network foundation: entry/middle/exit relays on 127.0.0.1, framed structured messages, plaintext onion layers, error propagation, logging, tests.
 - [x] v0.3 — MORP v1: Ed25519 relay identities, signed descriptors, ntor-style handshakes, layered ChaCha20-Poly1305 with replay protection, circuit IDs, encrypted replies, tests. Unreviewed.
 - [x] v0.4 — Cryptographic `.morp` addresses: Ed25519 service identities, signed expiring descriptors, localhost directory, authenticated encrypted service channel, static site hosting, `morp://` in MASK Browser with no DNS/clearnet fallback. Direct localhost prototype (location not hidden). Unreviewed.
-- [ ] v0.5: hidden-service circuits for `.morp` (introduction points, rendezvous circuits over MORP relays).
-- [ ] Other candidates: TLS/Noise-encrypted links and fixed-size cells; SOCKS5 proxy and real exit streams; browser network/circuit status panel.
+- [x] v0.5 — Relay-routed `.morp` hidden services: rendezvous-role relays, introduction points, rendezvous joins, encrypted introductions, service authentication, end-to-end encrypted multiplexed sessions, descriptor v2 (no location), browser loads full sites via MORP, no-bypass/auth/failure/cleanup tests. Direct v0.4 path removed. Unreviewed, localhost only.
+- [ ] Next candidates: intro point re-establishment and descriptor encryption; TLS/Noise-encrypted links and fixed-size cells; more relays and path rules (guards); browser circuit status panel; SOCKS5 and real exit streams.
 
 ## Project Documentation
 

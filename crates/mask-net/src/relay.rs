@@ -1,26 +1,39 @@
-//! MORP relay (entry, middle, or exit).
+//! MORP relay (entry, middle, exit, or rendezvous).
 //!
 //! A relay keeps a table of circuits. Each circuit has:
-//! - an inbound side: the link toward the client and its circuit ID there;
+//! - an inbound side: the link toward the circuit's creator and its ID there;
 //! - the hop's forward/backward [`CellCipher`]s from the ntor handshake;
 //! - optionally an outbound side: a link to the next relay and the circuit
 //!   ID used on that link.
 //!
 //! Forward cells (from the inbound link) are opened with this hop's key. The
 //! plaintext is either another sealed cell to pass to the next hop, or a
-//! command for this hop (EXTEND, or DATA at an exit). Backward cells (from
-//! the outbound link) and this hop's own replies are sealed with the
-//! backward key and sent toward the client, adding one layer.
+//! command for this hop. Backward cells (from the outbound link) and this
+//! hop's own replies are sealed with the backward key and sent toward the
+//! circuit's creator, adding one layer.
+//!
+//! **Rendezvous-role relays** (always the last hop) additionally act as
+//! hidden-service introduction points and rendezvous points:
+//! - `EstablishIntro` registers a service's per-intro auth key on its circuit;
+//!   `Introduce1` from a client is passed to that circuit as `Introduce2`.
+//! - `EstablishRendezvous` parks a client circuit under a single-use cookie;
+//!   `Rendezvous1` from a service with the same cookie *joins* the two
+//!   circuits. After that, `Stream` cells from one side are re-sealed for the
+//!   other. Their contents are end-to-end encrypted between client and
+//!   service, so this relay cannot read them.
 //!
 //! Links to the next relay are shared by every circuit going there, and
 //! circuit IDs keep them apart.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::crypto::CryptoError;
@@ -34,13 +47,22 @@ use crate::protocol::{
     CircId, DestroyReason, ErrorCode, LayerBody, LinkErrorCode, LinkMsg, RelayCmd, decode, encode,
 };
 use crate::transport::{
-    Connection, Link, LinkReader, Timeouts, handshake_inbound, handshake_outbound,
+    ConnectPolicy, Connection, Link, LinkReader, Timeouts, handshake_inbound, handshake_outbound,
 };
+
+/// Largest introduction payload accepted.
+const MAX_INTRO_PAYLOAD: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub circuits_per_link: usize,
     pub total_circuits: usize,
+    /// Introduction points registered at once (rendezvous role).
+    pub intro_points: usize,
+    /// Client circuits waiting at the rendezvous point at once.
+    pub pending_rendezvous: usize,
+    /// How long a rendezvous cookie stays valid.
+    pub rendezvous_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -48,7 +70,25 @@ impl Default for Limits {
         Self {
             circuits_per_link: 128,
             total_circuits: 4096,
+            intro_points: 256,
+            pending_rendezvous: 1024,
+            rendezvous_timeout: Duration::from_secs(60),
         }
+    }
+}
+
+/// Test hook: called with every plaintext this relay can decrypt (the
+/// contents of its own onion layer). Used to prove what a relay can and
+/// cannot see. `None` in normal operation.
+#[derive(Clone)]
+pub struct Observer(pub Arc<ObserveFn>);
+
+/// `(relay nickname, decrypted layer plaintext)`.
+pub type ObserveFn = dyn Fn(&str, &[u8]) + Send + Sync;
+
+impl std::fmt::Debug for Observer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Observer")
     }
 }
 
@@ -59,6 +99,8 @@ pub struct RelayConfig {
     pub listen: SocketAddr,
     pub timeouts: Timeouts,
     pub limits: Limits,
+    pub policy: ConnectPolicy,
+    pub observer: Option<Observer>,
 }
 
 impl RelayConfig {
@@ -69,6 +111,8 @@ impl RelayConfig {
             listen,
             timeouts: Timeouts::default(),
             limits: Limits::default(),
+            policy: ConnectPolicy::allow_all(),
+            observer: None,
         }
     }
 }
@@ -79,6 +123,45 @@ pub struct Relay {
     listener: TcpListener,
 }
 
+/// Inspect or stop a running relay.
+#[derive(Clone)]
+pub struct RelayHandle {
+    inner: Arc<Inner>,
+}
+
+/// A snapshot of relay activity, for tests and diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayStats {
+    pub open_circuits: usize,
+    pub intro_points: usize,
+    pub pending_rendezvous: usize,
+    /// Circuits currently joined to another circuit (counts both sides).
+    pub joined_circuits: usize,
+    pub circuits_created: u64,
+    /// Cells passed to the next hop.
+    pub cells_forwarded: u64,
+    /// Cells passed back toward a circuit's creator.
+    pub cells_returned: u64,
+    pub introductions: u64,
+    pub rendezvous_joins: u64,
+    /// Stream cells re-sealed from one joined circuit to the other.
+    pub stream_cells: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    circuits_created: AtomicU64,
+    cells_forwarded: AtomicU64,
+    cells_returned: AtomicU64,
+    introductions: AtomicU64,
+    rendezvous_joins: AtomicU64,
+    stream_cells: AtomicU64,
+}
+
+fn bump(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 struct Inner {
     keys: RelayKeys,
     nickname: String,
@@ -87,8 +170,13 @@ struct Inner {
     descriptor: RelayDescriptor,
     timeouts: Timeouts,
     limits: Limits,
+    policy: ConnectPolicy,
+    observer: Option<Observer>,
     table: Mutex<Table>,
+    hs: Mutex<HsTable>,
     out_links: tokio::sync::Mutex<HashMap<SocketAddr, Link>>,
+    counters: Counters,
+    shutdown: CancellationToken,
 }
 
 #[derive(Default)]
@@ -99,6 +187,15 @@ struct Table {
     by_out: HashMap<(u64, CircId), Arc<Circuit>>,
 }
 
+/// Hidden-service state of a rendezvous-role relay.
+#[derive(Default)]
+struct HsTable {
+    /// Intro auth key → the service's intro circuit.
+    intros: HashMap<[u8; 32], Arc<Circuit>>,
+    /// Rendezvous cookie → waiting client circuit and when it registered.
+    cookies: HashMap<[u8; 32], (Arc<Circuit>, Instant)>,
+}
+
 struct Circuit {
     inbound: Link,
     in_circ: CircId,
@@ -107,6 +204,7 @@ struct Circuit {
     /// so cells leave in counter order.
     backward: tokio::sync::Mutex<CellCipher>,
     next: Mutex<Next>,
+    hs: Mutex<CircHs>,
     closed: AtomicBool,
 }
 
@@ -135,11 +233,22 @@ impl Next {
     }
 }
 
+/// What a circuit is doing at a rendezvous-role relay.
+enum CircHs {
+    None,
+    /// A service's introduction circuit.
+    Intro([u8; 32]),
+    /// A client circuit waiting under a cookie.
+    Waiting([u8; 32]),
+    /// Joined to another circuit at this rendezvous point.
+    Joined(Weak<Circuit>),
+}
+
 impl Relay {
     pub async fn bind(config: RelayConfig, keys: RelayKeys) -> Result<Self, NetError> {
         if !config.role.is_relay() {
             return Err(NetError::InvalidConfig(
-                "a relay's role must be entry, middle, or exit".into(),
+                "a relay's role must be entry, middle, exit, or rendezvous".into(),
             ));
         }
         if !config.listen.ip().is_loopback() {
@@ -157,8 +266,13 @@ impl Relay {
                 descriptor,
                 timeouts: config.timeouts,
                 limits: config.limits,
+                policy: config.policy,
+                observer: config.observer,
                 table: Mutex::new(Table::default()),
+                hs: Mutex::new(HsTable::default()),
                 out_links: tokio::sync::Mutex::new(HashMap::new()),
+                counters: Counters::default(),
+                shutdown: CancellationToken::new(),
             }),
             listener,
         })
@@ -177,7 +291,13 @@ impl Relay {
         self.inner.descriptor.clone()
     }
 
-    /// Accept links until the task is cancelled.
+    pub fn handle(&self) -> RelayHandle {
+        RelayHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Accept links until [`RelayHandle::shutdown`] is called.
     pub async fn serve(self) -> Result<(), NetError> {
         let span = info_span!(
             "relay",
@@ -192,11 +312,15 @@ impl Relay {
                 "relay started"
             );
             loop {
-                let (stream, peer) = match self.listener.accept().await {
+                let accepted = tokio::select! {
+                    accepted = self.listener.accept() => accepted,
+                    _ = self.inner.shutdown.cancelled() => break,
+                };
+                let (stream, peer) = match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         warn!(error = %e, "accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
@@ -207,15 +331,63 @@ impl Relay {
                         .instrument(tracing::Span::current()),
                 );
             }
+            info!("relay stopped");
+            Ok(())
         }
         .instrument(span)
         .await
     }
 }
 
+impl RelayHandle {
+    pub fn stats(&self) -> RelayStats {
+        let (open_circuits, joined_circuits) = {
+            let table = self.inner.table.lock().unwrap();
+            let joined = table
+                .by_in
+                .values()
+                .filter(|c| matches!(*c.hs.lock().unwrap(), CircHs::Joined(_)))
+                .count();
+            (table.by_in.len(), joined)
+        };
+        let (intro_points, pending_rendezvous) = {
+            let hs = self.inner.hs.lock().unwrap();
+            (hs.intros.len(), hs.cookies.len())
+        };
+        let c = &self.inner.counters;
+        RelayStats {
+            open_circuits,
+            intro_points,
+            pending_rendezvous,
+            joined_circuits,
+            circuits_created: c.circuits_created.load(Ordering::Relaxed),
+            cells_forwarded: c.cells_forwarded.load(Ordering::Relaxed),
+            cells_returned: c.cells_returned.load(Ordering::Relaxed),
+            introductions: c.introductions.load(Ordering::Relaxed),
+            rendezvous_joins: c.rendezvous_joins.load(Ordering::Relaxed),
+            stream_cells: c.stream_cells.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stop accepting, close every link, and destroy every circuit.
+    pub fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+    }
+
+    pub fn descriptor(&self) -> RelayDescriptor {
+        self.inner.descriptor.clone()
+    }
+}
+
 impl Inner {
     fn fail_detail(&self, detail: &str) -> String {
         format!("{} ({}): {detail}", self.nickname, self.role)
+    }
+
+    fn observe(&self, plaintext: &[u8]) {
+        if let Some(observer) = &self.observer {
+            (observer.0)(&self.nickname, plaintext);
+        }
     }
 
     // ------------------------------------------------------------ inbound
@@ -235,7 +407,11 @@ impl Inner {
         let (link, mut reader) = conn.into_link();
 
         let result = loop {
-            let msg = match reader.recv(Some(self.timeouts.idle)).await {
+            let received = tokio::select! {
+                received = reader.recv(Some(self.timeouts.idle)) => received,
+                _ = self.shutdown.cancelled() => break Ok(()),
+            };
+            let msg = match received {
                 Ok(Some(msg)) => msg,
                 Ok(None) => break Ok(()),
                 Err(e @ NetError::Decode(_)) => {
@@ -246,6 +422,13 @@ impl Inner {
                         })
                         .await;
                     break Err(e);
+                }
+                // Idle links are closed only if they carry no circuits: a
+                // hidden service's introduction circuits are legitimately quiet.
+                Err(NetError::Timeout) if self.link_has_circuits(link.id()) => continue,
+                Err(NetError::Timeout) => {
+                    info!("closing idle link with no circuits");
+                    break Ok(());
                 }
                 Err(e) => break Err(e),
             };
@@ -326,6 +509,7 @@ impl Inner {
             forward: Mutex::new(CellCipher::new(&keys.forward, Direction::Forward)),
             backward: tokio::sync::Mutex::new(CellCipher::new(&keys.backward, Direction::Backward)),
             next: Mutex::new(Next::None),
+            hs: Mutex::new(CircHs::None),
             closed: AtomicBool::new(false),
         });
         drop(keys);
@@ -335,6 +519,7 @@ impl Inner {
             .by_in
             .insert((link.id(), circ), circuit);
         if link.send(LinkMsg::Created { circ, reply }).await.is_ok() {
+            bump(&self.counters.circuits_created);
             info!(circ, "circuit created");
         }
     }
@@ -361,6 +546,7 @@ impl Inner {
                 return;
             }
         };
+        self.observe(&plaintext);
         let Ok(body) = decode::<LayerBody>(&plaintext) else {
             warn!(circ, "undecodable layer; destroying circuit");
             self.teardown(&circuit, DestroyReason::ProtocolViolation, true, true)
@@ -386,6 +572,8 @@ impl Inner {
                         if sent.is_err() {
                             self.teardown(&circuit, DestroyReason::NextHopFailed, true, false)
                                 .await;
+                        } else {
+                            bump(&self.counters.cells_forwarded);
                         }
                     }
                     _ => {
@@ -399,16 +587,20 @@ impl Inner {
         }
     }
 
+    fn is_last_hop(&self, circuit: &Circuit) -> bool {
+        matches!(*circuit.next.lock().unwrap(), Next::None)
+    }
+
     async fn on_command(self: &Arc<Self>, circuit: &Arc<Circuit>, cmd: RelayCmd) {
         let circ = circuit.in_circ;
         match cmd {
             RelayCmd::Extend { next_hop, request } => {
-                let refusal = if self.role.expected_downstream().is_none() {
+                let refusal = if !self.role.extends() {
                     Some((
                         ErrorCode::NotAllowed,
-                        "exit relays do not extend".to_owned(),
+                        format!("{} relays do not extend", self.role),
                     ))
-                } else if !matches!(*circuit.next.lock().unwrap(), Next::None) {
+                } else if !self.is_last_hop(circuit) {
                     Some((
                         ErrorCode::NotAllowed,
                         "circuit is already extended".to_owned(),
@@ -440,8 +632,7 @@ impl Inner {
                 );
             }
             RelayCmd::Data { bytes } => {
-                let is_last = matches!(*circuit.next.lock().unwrap(), Next::None);
-                if self.role == Role::Exit && is_last {
+                if self.role == Role::Exit && self.is_last_hop(circuit) {
                     info!(
                         circ,
                         bytes = bytes.len(),
@@ -460,13 +651,230 @@ impl Inner {
                     .await;
                 }
             }
-            RelayCmd::Extended { .. } | RelayCmd::Error { .. } => {
-                warn!(circ, "client sent a relay-only command");
+            cmd @ (RelayCmd::EstablishIntro { .. }
+            | RelayCmd::Introduce1 { .. }
+            | RelayCmd::EstablishRendezvous { .. }
+            | RelayCmd::Rendezvous1 { .. }
+            | RelayCmd::Stream { .. }) => {
+                if self.role != Role::Rendezvous || !self.is_last_hop(circuit) {
+                    self.reply_error(
+                        circuit,
+                        ErrorCode::NotAllowed,
+                        "hidden-service commands go to the last hop, a rendezvous relay",
+                    )
+                    .await;
+                    return;
+                }
+                self.on_hidden_service(circuit, cmd).await;
+            }
+            RelayCmd::Extended { .. }
+            | RelayCmd::Error { .. }
+            | RelayCmd::IntroEstablished
+            | RelayCmd::IntroduceAck
+            | RelayCmd::Introduce2 { .. }
+            | RelayCmd::RendezvousEstablished
+            | RelayCmd::Rendezvous2 { .. } => {
+                warn!(circ, "creator sent a relay-only command");
                 self.teardown(circuit, DestroyReason::ProtocolViolation, true, true)
                     .await;
             }
         }
     }
+
+    // ------------------------------------------------- hidden services
+
+    async fn on_hidden_service(&self, circuit: &Arc<Circuit>, cmd: RelayCmd) {
+        let circ = circuit.in_circ;
+        let unused = matches!(*circuit.hs.lock().unwrap(), CircHs::None);
+        match cmd {
+            RelayCmd::EstablishIntro {
+                auth_key,
+                signature,
+            } => {
+                if !unused {
+                    return self
+                        .reply_error(circuit, ErrorCode::NotAllowed, "circuit already in use")
+                        .await;
+                }
+                if crate::hs::crypto::verify_establish_intro(
+                    &auth_key,
+                    &self.keys.node_id(),
+                    &signature,
+                )
+                .is_err()
+                {
+                    warn!(circ, "EstablishIntro with a bad signature");
+                    return self
+                        .reply_error(circuit, ErrorCode::Rejected, "bad intro signature")
+                        .await;
+                }
+                let refusal = {
+                    let mut hs = self.hs.lock().unwrap();
+                    if hs.intros.len() >= self.limits.intro_points {
+                        Some((ErrorCode::ResourceLimit, "too many intro points"))
+                    } else if hs
+                        .intros
+                        .get(&auth_key)
+                        .is_some_and(|c| !c.closed.load(Ordering::SeqCst))
+                    {
+                        Some((ErrorCode::Rejected, "auth key already registered"))
+                    } else {
+                        hs.intros.insert(auth_key, Arc::clone(circuit));
+                        *circuit.hs.lock().unwrap() = CircHs::Intro(auth_key);
+                        None
+                    }
+                };
+                match refusal {
+                    Some((code, detail)) => self.reply_error(circuit, code, detail).await,
+                    None => {
+                        info!(circ, "introduction point established");
+                        self.send_backward(circuit, LayerBody::Cmd(RelayCmd::IntroEstablished))
+                            .await;
+                    }
+                }
+            }
+
+            RelayCmd::Introduce1 { auth_key, payload } => {
+                if !unused || payload.len() > MAX_INTRO_PAYLOAD {
+                    return self
+                        .reply_error(circuit, ErrorCode::Rejected, "invalid introduction")
+                        .await;
+                }
+                let service = self
+                    .hs
+                    .lock()
+                    .unwrap()
+                    .intros
+                    .get(&auth_key)
+                    .filter(|c| !c.closed.load(Ordering::SeqCst))
+                    .cloned();
+                let Some(service) = service else {
+                    return self
+                        .reply_error(
+                            circuit,
+                            ErrorCode::UnknownService,
+                            "no service registered for this intro key",
+                        )
+                        .await;
+                };
+                bump(&self.counters.introductions);
+                info!(circ, "forwarding introduction to service");
+                self.send_backward(&service, LayerBody::Cmd(RelayCmd::Introduce2 { payload }))
+                    .await;
+                self.send_backward(circuit, LayerBody::Cmd(RelayCmd::IntroduceAck))
+                    .await;
+            }
+
+            RelayCmd::EstablishRendezvous { cookie } => {
+                if !unused {
+                    return self
+                        .reply_error(circuit, ErrorCode::NotAllowed, "circuit already in use")
+                        .await;
+                }
+                let refusal = {
+                    let mut hs = self.hs.lock().unwrap();
+                    let ttl = self.limits.rendezvous_timeout;
+                    hs.cookies.retain(|_, (c, at)| {
+                        at.elapsed() < ttl && !c.closed.load(Ordering::SeqCst)
+                    });
+                    if hs.cookies.len() >= self.limits.pending_rendezvous {
+                        Some((ErrorCode::ResourceLimit, "too many pending rendezvous"))
+                    } else {
+                        match hs.cookies.entry(cookie) {
+                            Entry::Occupied(_) => {
+                                Some((ErrorCode::BadCookie, "cookie already in use"))
+                            }
+                            Entry::Vacant(slot) => {
+                                slot.insert((Arc::clone(circuit), Instant::now()));
+                                *circuit.hs.lock().unwrap() = CircHs::Waiting(cookie);
+                                None
+                            }
+                        }
+                    }
+                };
+                match refusal {
+                    Some((code, detail)) => self.reply_error(circuit, code, detail).await,
+                    None => {
+                        info!(circ, "rendezvous point established");
+                        self.send_backward(
+                            circuit,
+                            LayerBody::Cmd(RelayCmd::RendezvousEstablished),
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            RelayCmd::Rendezvous1 { cookie, payload } => {
+                if !unused || payload.len() > MAX_INTRO_PAYLOAD {
+                    return self
+                        .reply_error(circuit, ErrorCode::Rejected, "invalid rendezvous")
+                        .await;
+                }
+                // Single use: the cookie is removed whether or not it matches.
+                let waiting = self.hs.lock().unwrap().cookies.remove(&cookie);
+                let client = match waiting {
+                    Some((client, at))
+                        if at.elapsed() < self.limits.rendezvous_timeout
+                            && !client.closed.load(Ordering::SeqCst) =>
+                    {
+                        client
+                    }
+                    _ => {
+                        warn!(circ, "Rendezvous1 with unknown or expired cookie");
+                        return self
+                            .reply_error(
+                                circuit,
+                                ErrorCode::BadCookie,
+                                "unknown, expired, or used cookie",
+                            )
+                            .await;
+                    }
+                };
+                *client.hs.lock().unwrap() = CircHs::Joined(Arc::downgrade(circuit));
+                *circuit.hs.lock().unwrap() = CircHs::Joined(Arc::downgrade(&client));
+                bump(&self.counters.rendezvous_joins);
+                info!(
+                    client_circ = client.in_circ,
+                    service_circ = circ,
+                    "circuits joined"
+                );
+                self.send_backward(&client, LayerBody::Cmd(RelayCmd::Rendezvous2 { payload }))
+                    .await;
+            }
+
+            RelayCmd::Stream { bytes } => {
+                let peer = match &*circuit.hs.lock().unwrap() {
+                    CircHs::Joined(peer) => peer.upgrade(),
+                    _ => None,
+                };
+                match peer {
+                    Some(peer) if !peer.closed.load(Ordering::SeqCst) => {
+                        bump(&self.counters.stream_cells);
+                        self.send_backward(&peer, LayerBody::Cmd(RelayCmd::Stream { bytes }))
+                            .await;
+                    }
+                    _ if matches!(*circuit.hs.lock().unwrap(), CircHs::Joined(_)) => {
+                        // The other side is gone.
+                        self.teardown(circuit, DestroyReason::NextHopFailed, true, false)
+                            .await;
+                    }
+                    _ => {
+                        self.reply_error(
+                            circuit,
+                            ErrorCode::NotAllowed,
+                            "circuit is not joined at this rendezvous point",
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            _ => unreachable!("only hidden-service commands are routed here"),
+        }
+    }
+
+    // ------------------------------------------------------- extending
 
     async fn extend(
         self: Arc<Self>,
@@ -556,7 +964,7 @@ impl Inner {
         }
     }
 
-    /// Forget a pending extension and tell the client why.
+    /// Forget a pending extension and tell the creator why.
     async fn abandon_extend(
         &self,
         circuit: &Arc<Circuit>,
@@ -577,18 +985,20 @@ impl Inner {
     // ----------------------------------------------------------- outbound
 
     async fn outbound_link(self: &Arc<Self>, addr: SocketAddr) -> Result<Link, NetError> {
-        let expected = self
-            .role
-            .expected_downstream()
-            .expect("only entry and middle relays extend");
+        let allowed: Vec<Role> = [Role::Middle, Role::Exit, Role::Rendezvous]
+            .into_iter()
+            .filter(|r| self.role.can_extend_to(*r))
+            .collect();
         let mut links = self.out_links.lock().await;
         if let Some(link) = links.get(&addr)
             && !link.is_closed()
         {
             return Ok(link.clone());
         }
-        let mut conn = Connection::connect(addr, self.timeouts.connect).await?;
-        handshake_outbound(&mut conn, self.role, expected, self.timeouts.handshake).await?;
+        let origin = format!("relay:{}", self.nickname);
+        let mut conn =
+            Connection::connect_checked(addr, self.timeouts.connect, &self.policy, &origin).await?;
+        handshake_outbound(&mut conn, self.role, &allowed, self.timeouts.handshake).await?;
         let (link, reader) = conn.into_link();
         links.insert(addr, link.clone());
         info!(next_hop = %addr, "outbound link opened");
@@ -602,7 +1012,11 @@ impl Inner {
 
     async fn serve_outbound(self: Arc<Self>, link: Link, mut reader: LinkReader) {
         let result: Result<(), NetError> = loop {
-            let msg = match reader.recv(None).await {
+            let received = tokio::select! {
+                received = reader.recv(None) => received,
+                _ = self.shutdown.cancelled() => break Ok(()),
+            };
+            let msg = match received {
                 Ok(Some(msg)) => msg,
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
@@ -637,6 +1051,7 @@ impl Inner {
                     let open = matches!(&*circuit.next.lock().unwrap(), Next::Open { .. });
                     if open {
                         debug!(circ = circuit.in_circ, bytes = cell.len(), "returning cell");
+                        bump(&self.counters.cells_returned);
                         self.send_backward(&circuit, LayerBody::Relay(cell)).await;
                     }
                 }
@@ -648,7 +1063,7 @@ impl Inner {
                         matches!(&*circuit.next.lock().unwrap(), Next::Extending { .. });
                     if extending {
                         // The next relay refused CREATE: keep the circuit up to
-                        // here and tell the client.
+                        // here and tell the creator.
                         self.abandon_extend(
                             &circuit,
                             &link,
@@ -700,6 +1115,15 @@ impl Inner {
 
     // ------------------------------------------------------------ helpers
 
+    fn link_has_circuits(&self, link: u64) -> bool {
+        self.table
+            .lock()
+            .unwrap()
+            .by_in
+            .keys()
+            .any(|(l, _)| *l == link)
+    }
+
     fn lookup_in(&self, link: u64, circ: CircId) -> Option<Arc<Circuit>> {
         self.table.lock().unwrap().by_in.get(&(link, circ)).cloned()
     }
@@ -713,8 +1137,11 @@ impl Inner {
             .cloned()
     }
 
-    /// Seal `body` with this hop's backward key and send it toward the client.
+    /// Seal `body` with this hop's backward key and send it toward the creator.
     async fn send_backward(&self, circuit: &Arc<Circuit>, body: LayerBody) {
+        if circuit.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let plaintext = encode(&body);
         let mut cipher = circuit.backward.lock().await;
         let cell = match cipher.seal(&plaintext) {
@@ -722,8 +1149,7 @@ impl Inner {
             Err(e) => {
                 drop(cipher);
                 warn!(circ = circuit.in_circ, error = %e, "cannot seal backward cell");
-                self.teardown(circuit, DestroyReason::ResourceLimit, true, true)
-                    .await;
+                Box::pin(self.teardown(circuit, DestroyReason::ResourceLimit, true, true)).await;
                 return;
             }
         };
@@ -737,9 +1163,6 @@ impl Inner {
     }
 
     async fn reply_error(&self, circuit: &Arc<Circuit>, code: ErrorCode, detail: &str) {
-        if circuit.closed.load(Ordering::SeqCst) {
-            return;
-        }
         let body = LayerBody::Cmd(RelayCmd::Error {
             code,
             detail: self.fail_detail(detail),
@@ -747,7 +1170,8 @@ impl Inner {
         self.send_backward(circuit, body).await;
     }
 
-    /// Remove a circuit and optionally tell the neighbours.
+    /// Remove a circuit and optionally tell the neighbours. A circuit joined
+    /// at this rendezvous point takes its partner down with it.
     async fn teardown(
         &self,
         circuit: &Arc<Circuit>,
@@ -767,6 +1191,30 @@ impl Inner {
             }
             next
         };
+        let hs_state = std::mem::replace(&mut *circuit.hs.lock().unwrap(), CircHs::None);
+        let partner = {
+            let mut hs = self.hs.lock().unwrap();
+            match hs_state {
+                CircHs::Intro(key) => {
+                    if hs.intros.get(&key).is_some_and(|c| Arc::ptr_eq(c, circuit)) {
+                        hs.intros.remove(&key);
+                    }
+                    None
+                }
+                CircHs::Waiting(cookie) => {
+                    if hs
+                        .cookies
+                        .get(&cookie)
+                        .is_some_and(|(c, _)| Arc::ptr_eq(c, circuit))
+                    {
+                        hs.cookies.remove(&cookie);
+                    }
+                    None
+                }
+                CircHs::Joined(peer) => peer.upgrade(),
+                CircHs::None => None,
+            }
+        };
         info!(circ = circuit.in_circ, ?reason, "circuit destroyed");
         if notify_inbound {
             let _ = circuit
@@ -785,11 +1233,13 @@ impl Inner {
                 })
                 .await;
         }
+        if let Some(partner) = partner {
+            Box::pin(self.teardown(&partner, DestroyReason::NextHopFailed, true, false)).await;
+        }
     }
 }
 
 /// Test service run by exit relays: returns the data unchanged.
-/// Real exit traffic (TCP streams to websites) is a later milestone.
 fn echo_service(data: Vec<u8>) -> Vec<u8> {
     data
 }

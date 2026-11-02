@@ -178,33 +178,35 @@ impl RelayDescriptor {
     }
 }
 
-/// The three relays of a circuit, in order.
+/// The three relays of a circuit, in order. The last hop is an exit (echo
+/// test service) or a rendezvous-role relay (hidden services).
 #[derive(Clone, Debug)]
 pub struct CircuitPath {
     pub entry: RelayDescriptor,
     pub middle: RelayDescriptor,
-    pub exit: RelayDescriptor,
+    pub last: RelayDescriptor,
 }
 
 impl CircuitPath {
     pub fn new(
         entry: RelayDescriptor,
         middle: RelayDescriptor,
-        exit: RelayDescriptor,
+        last: RelayDescriptor,
     ) -> Result<Self, NetError> {
         let path = Self {
             entry,
             middle,
-            exit,
+            last,
         };
-        for (d, role) in path
-            .hops()
-            .into_iter()
-            .zip([Role::Entry, Role::Middle, Role::Exit])
-        {
-            if d.role != role {
+        let role_ok = [
+            path.entry.role == Role::Entry,
+            path.middle.role == Role::Middle,
+            path.last.role.is_last_hop(),
+        ];
+        for (d, ok) in path.hops().into_iter().zip(role_ok) {
+            if !ok {
                 return Err(NetError::InvalidConfig(format!(
-                    "{} is a {} relay, needed a {role}",
+                    "{} is a {} relay, which cannot be used in that position",
                     d.nickname, d.role
                 )));
             }
@@ -212,7 +214,7 @@ impl CircuitPath {
                 return Err(NetError::NotLoopback(d.addr));
             }
         }
-        let ids = [path.entry.node_id, path.middle.node_id, path.exit.node_id];
+        let ids = [path.entry.node_id, path.middle.node_id, path.last.node_id];
         if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
             return Err(NetError::InvalidConfig(
                 "a path must use three different relays".into(),
@@ -222,7 +224,7 @@ impl CircuitPath {
     }
 
     pub fn hops(&self) -> [&RelayDescriptor; 3] {
-        [&self.entry, &self.middle, &self.exit]
+        [&self.entry, &self.middle, &self.last]
     }
 }
 
@@ -270,20 +272,46 @@ impl Directory {
         &self.relays
     }
 
-    /// Pick one relay of each role, at random among candidates.
+    /// A uniformly random relay with `role`, avoiding `avoid` if possible.
+    pub fn random_relay(&self, role: Role, avoid: &[NodeId]) -> Option<RelayDescriptor> {
+        let all: Vec<_> = self.relays.iter().filter(|d| d.role == role).collect();
+        let preferred: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|d| !avoid.contains(&d.node_id))
+            .collect();
+        let pool = if preferred.is_empty() { all } else { preferred };
+        if pool.is_empty() {
+            return None;
+        }
+        let index = u64::from_le_bytes(crate::crypto::random_bytes::<8>()) as usize % pool.len();
+        Some(pool[index].clone())
+    }
+
+    /// The relay with this identity, if the directory has it.
+    pub fn find(&self, node_id: &NodeId) -> Option<&RelayDescriptor> {
+        self.relays.iter().find(|d| d.node_id == *node_id)
+    }
+
+    /// Random entry and middle, ending at `last`.
+    pub fn path_ending_at(&self, last: &RelayDescriptor) -> Result<CircuitPath, NetError> {
+        let missing =
+            |role: Role| NetError::InvalidConfig(format!("no {role} relay in the directory"));
+        let entry = self
+            .random_relay(Role::Entry, &[])
+            .ok_or_else(|| missing(Role::Entry))?;
+        let middle = self
+            .random_relay(Role::Middle, &[])
+            .ok_or_else(|| missing(Role::Middle))?;
+        CircuitPath::new(entry, middle, last.clone())
+    }
+
+    /// Random entry → middle → exit path (echo test service).
     pub fn choose_path(&self) -> Result<CircuitPath, NetError> {
-        let pick = |role: Role| {
-            let candidates: Vec<_> = self.relays.iter().filter(|d| d.role == role).collect();
-            if candidates.is_empty() {
-                return Err(NetError::InvalidConfig(format!(
-                    "no {role} relay in the directory"
-                )));
-            }
-            let index =
-                u64::from_le_bytes(crate::crypto::random_bytes::<8>()) as usize % candidates.len();
-            Ok(candidates[index].clone())
-        };
-        CircuitPath::new(pick(Role::Entry)?, pick(Role::Middle)?, pick(Role::Exit)?)
+        let exit = self
+            .random_relay(Role::Exit, &[])
+            .ok_or_else(|| NetError::InvalidConfig("no exit relay in the directory".into()))?;
+        self.path_ending_at(&exit)
     }
 }
 

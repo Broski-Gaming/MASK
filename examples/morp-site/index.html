@@ -9,12 +9,13 @@
 <main>
   <img src="/img/logo.svg" alt="MORP logo" width="96" height="96">
   <h1>Hello from a <code>.morp</code> service</h1>
-  <p>This page is served by a MORP service whose address is its Ed25519 public key.
-     MASK Browser found it through the local MORP directory and the service proved
-     it holds the matching private key.</p>
+  <p>This page is served by a MORP hidden service whose address is its Ed25519
+     public key. MASK Browser found it through the local MORP directory, reached it
+     only through MORP relay circuits joined at a rendezvous point, and the service
+     proved it holds the matching private key.</p>
   <p id="js-status" class="pending">JavaScript: not running</p>
-  <p class="note">v0.4 prototype: the connection is direct over localhost, so the
-     service's location is <strong>not hidden</strong>. Not anonymous.</p>
+  <p class="note">Experimental and unreviewed. Everything runs on this computer;
+     this is <strong>not</strong> Tor-level anonymity.</p>
 </main>
 <script src="/app.js"></script>
 </body>

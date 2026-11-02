@@ -79,11 +79,23 @@ impl Connection {
         })
     }
 
+    /// Connect without a policy check (tests and tools only).
     pub async fn connect(addr: SocketAddr, limit: Duration) -> Result<Self, NetError> {
         let stream = timeout(limit, TcpStream::connect(addr))
             .await
             .map_err(|_| NetError::Timeout)??;
         Self::new(stream)
+    }
+
+    /// Connect after checking `policy` for this `origin`.
+    pub async fn connect_checked(
+        addr: SocketAddr,
+        limit: Duration,
+        policy: &ConnectPolicy,
+        origin: &str,
+    ) -> Result<Self, NetError> {
+        policy.check(origin, addr)?;
+        Self::connect(addr, limit).await
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
@@ -192,12 +204,13 @@ where
 }
 
 /// Opening side of the link handshake.
+/// The peer's role must be one of `allowed`; it is returned on success.
 pub async fn handshake_outbound(
     conn: &mut Connection,
     my_role: Role,
-    expected: Role,
+    allowed: &[Role],
     limit: Duration,
-) -> Result<(), NetError> {
+) -> Result<Role, NetError> {
     conn.send(&LinkMsg::Hello {
         version: MORP_VERSION,
         role: my_role,
@@ -209,13 +222,13 @@ pub async fn handshake_outbound(
                 Err(NetError::Protocol(format!(
                     "peer speaks MORP v{version}, we speak v{MORP_VERSION}"
                 )))
-            } else if role != expected {
+            } else if !allowed.contains(&role) {
                 Err(NetError::Protocol(format!(
-                    "expected a {expected} relay at {}, found a {role} relay",
+                    "unexpected {role} relay at {}",
                     conn.peer_addr()
                 )))
             } else {
-                Ok(())
+                Ok(role)
             }
         }
         Some(LinkMsg::LinkError { code, detail }) => Err(NetError::LinkRejected { code, detail }),
@@ -275,5 +288,52 @@ pub async fn handshake_inbound(
                 .await;
             Err(NetError::Protocol(detail))
         }
+    }
+}
+
+/// Decides whether a component may open a TCP connection.
+///
+/// Every outbound connection in mask-net (client links, relay links, the
+/// hidden-service host's connection to its local app) goes through a policy
+/// check. The default allows everything; tests install a policy that records
+/// each attempt and denies anything not on the expected route, which proves
+/// that, for example, a browser never connects directly to a service.
+#[derive(Clone, Default)]
+pub struct ConnectPolicy {
+    rule: Option<std::sync::Arc<PolicyFn>>,
+}
+
+type PolicyFn = dyn Fn(&str, SocketAddr) -> bool + Send + Sync;
+
+impl ConnectPolicy {
+    pub fn allow_all() -> Self {
+        Self::default()
+    }
+
+    /// `rule(origin, destination)` returns whether the connection is allowed.
+    pub fn new(rule: impl Fn(&str, SocketAddr) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            rule: Some(std::sync::Arc::new(rule)),
+        }
+    }
+
+    pub fn check(&self, origin: &str, addr: SocketAddr) -> Result<(), NetError> {
+        match &self.rule {
+            Some(rule) if !rule(origin, addr) => Err(NetError::PolicyDenied {
+                origin: origin.to_owned(),
+                addr,
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ConnectPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.rule.is_some() {
+            "ConnectPolicy(custom)"
+        } else {
+            "ConnectPolicy(allow all)"
+        })
     }
 }

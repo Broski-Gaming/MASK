@@ -11,7 +11,6 @@ use std::error::Error;
 use gtk::glib;
 use gtk::prelude::*;
 use mask_net::address::is_clearnet_morp_url;
-use mask_net::service::fetch::FetchTimeouts;
 use webkit2gtk::WebViewExt;
 use wry::{WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
 
@@ -22,10 +21,11 @@ pub const WINDOW_TITLE: &str = "MASK Browser";
 /// Honest descriptions of the current connection, shown in the toolbar.
 const WEB_STATUS: &str = "Direct connection · not anonymous";
 const WEB_TOOLTIP: &str = "Websites are loaded directly. They see your real IP address.";
-const MORP_STATUS: &str = "MORP service · localhost prototype · not anonymous";
-const MORP_TOOLTIP: &str = "Resolved through the local MORP directory (no DNS). The service \
-    must prove it owns this .morp address. v0.4 connects directly over localhost: relays are \
-    not used and the service's location is not hidden.";
+const MORP_STATUS: &str = "MORP service · via relay circuits · experimental";
+const MORP_TOOLTIP: &str = "Found through the local MORP directory (no DNS) and reached only \
+    through MORP relay circuits joined at a rendezvous point. The service proved it owns this \
+    .morp address; traffic is end-to-end encrypted. Experimental and unreviewed: not Tor-level \
+    anonymity, and everything currently runs on this computer.";
 
 /// Build the window and run the GTK main loop until it is closed.
 /// `initial` is an optional address to open, validated like address bar input.
@@ -40,7 +40,7 @@ pub fn run(initial: Option<&str>) -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()?;
     let morp_runtime = runtime.handle().clone();
-    let directory = crate::morp::directory_client()?;
+    let morp = crate::morp::morp_client()?;
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(WINDOW_TITLE);
@@ -86,10 +86,9 @@ pub fn run(initial: Option<&str>) -> Result<(), Box<dyn Error>> {
         .with_asynchronous_custom_protocol("morp".into(), move |_id, request, responder| {
             let method = request.method().as_str().to_owned();
             let uri = request.uri().to_string();
-            let directory = directory.clone();
+            let morp = morp.clone();
             morp_runtime.spawn(async move {
-                let response =
-                    crate::morp::handle(&directory, &method, &uri, FetchTimeouts::default()).await;
+                let response = crate::morp::handle(&morp, &method, &uri).await;
                 responder.respond(response);
             });
         })

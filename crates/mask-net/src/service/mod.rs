@@ -1,22 +1,14 @@
 //! MORP services: sites identified only by a cryptographic `.morp` address.
 //!
-//! **v0.4 prototype — location is NOT hidden.** A service's descriptor
-//! contains its real loopback address, and clients connect to it directly.
-//! The connection is authenticated (the service proves it holds the
-//! address's private key) and encrypted, but the relays are not used yet.
-//! Introduction points and rendezvous circuits are planned for v0.5.
-//!
 //! - [`keys`]: service identity keys and their storage.
-//! - [`descriptor`]: signed, expiring service descriptors and withdrawals.
-//! - [`channel`]: authenticated, encrypted client ↔ service connection.
+//! - [`descriptor`]: signed, expiring service descriptors (introduction
+//!   points only, no location) and withdrawals.
 //! - [`site`]: safe static-file serving from a site folder.
-//! - [`host`]: the service host (listener + site).
-//! - [`fetch`]: resolve an address through the directory and fetch a page.
+//!
+//! Hosting and connecting happen through relay circuits; see
+//! [`crate::hs`].
 
-pub mod channel;
 pub mod descriptor;
-pub mod fetch;
-pub mod host;
 pub mod keys;
 pub mod site;
 

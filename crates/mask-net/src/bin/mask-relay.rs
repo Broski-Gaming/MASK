@@ -15,12 +15,13 @@ use tracing::{error, info};
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Relay role: entry, middle, or exit.
+    /// Relay role: entry, middle, exit, or rendezvous (hidden-service
+    /// introduction and rendezvous point).
     #[arg(long)]
     role: Role,
 
     /// Address to listen on (must be loopback).
-    /// Defaults: entry 127.0.0.1:7101, middle :7102, exit :7103.
+    /// Defaults: entry 127.0.0.1:7101, middle :7102, exit :7103, rendezvous :7104.
     #[arg(long)]
     listen: Option<SocketAddr>,
 
@@ -43,6 +44,7 @@ fn default_listen(role: Role) -> SocketAddr {
         Role::Entry => 7101,
         Role::Middle => 7102,
         Role::Exit | Role::Client => 7103,
+        Role::Rendezvous => 7104,
     };
     SocketAddr::from(([127, 0, 0, 1], port))
 }

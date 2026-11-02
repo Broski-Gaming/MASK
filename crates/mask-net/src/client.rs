@@ -26,7 +26,7 @@ use crate::identity::Role;
 use crate::protocol::{
     CircId, DestroyReason, LayerBody, LinkMsg, MAX_DATA_LEN, RelayCmd, decode, encode,
 };
-use crate::transport::{Connection, Link, LinkReader, Timeouts, handshake_outbound};
+use crate::transport::{ConnectPolicy, Connection, Link, LinkReader, Timeouts, handshake_outbound};
 
 type Routes = Arc<Mutex<HashMap<CircId, mpsc::Sender<LinkMsg>>>>;
 
@@ -41,11 +41,22 @@ pub struct ClientLink {
 
 impl ClientLink {
     pub async fn connect(entry: &RelayDescriptor, timeouts: Timeouts) -> Result<Self, NetError> {
+        Self::connect_with(entry, timeouts, &ConnectPolicy::allow_all(), "client").await
+    }
+
+    /// Connect after checking `policy` (`origin` names this component).
+    pub async fn connect_with(
+        entry: &RelayDescriptor,
+        timeouts: Timeouts,
+        policy: &ConnectPolicy,
+        origin: &str,
+    ) -> Result<Self, NetError> {
         if !entry.addr.ip().is_loopback() {
             return Err(NetError::NotLoopback(entry.addr));
         }
-        let mut conn = Connection::connect(entry.addr, timeouts.connect).await?;
-        handshake_outbound(&mut conn, Role::Client, Role::Entry, timeouts.handshake).await?;
+        let mut conn =
+            Connection::connect_checked(entry.addr, timeouts.connect, policy, origin).await?;
+        handshake_outbound(&mut conn, Role::Client, &[Role::Entry], timeouts.handshake).await?;
         let (link, reader) = conn.into_link();
         let routes: Routes = Arc::default();
         tokio::spawn(dispatch(reader, Arc::clone(&routes)));
@@ -67,7 +78,7 @@ impl ClientLink {
         let mut circuit = self.new_circuit();
         circuit.create(&path.entry).await?;
         circuit.extend(&path.middle).await?;
-        circuit.extend(&path.exit).await?;
+        circuit.extend(&path.last).await?;
         Ok(circuit)
     }
 
@@ -222,6 +233,82 @@ impl Circuit {
         }
     }
 
+    fn last_hop(&self) -> Result<usize, NetError> {
+        self.hops
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| NetError::InvalidConfig("circuit has no hops".into()))
+    }
+
+    /// Send `cmd` to the last hop and wait for the last hop's reply. An
+    /// `Error` from any hop becomes [`NetError::Remote`].
+    pub async fn request(
+        &mut self,
+        cmd: RelayCmd,
+        limit: std::time::Duration,
+    ) -> Result<RelayCmd, NetError> {
+        self.send_to_last(cmd).await?;
+        self.recv_from_last(Some(limit)).await
+    }
+
+    /// Send `cmd` to the last hop without waiting for a reply.
+    pub async fn send_to_last(&mut self, cmd: RelayCmd) -> Result<(), NetError> {
+        let last = self.last_hop()?;
+        self.send_cmd(last, cmd).await
+    }
+
+    /// Next command from the last hop. `None` waits indefinitely.
+    pub async fn recv_from_last(
+        &mut self,
+        limit: Option<std::time::Duration>,
+    ) -> Result<RelayCmd, NetError> {
+        let last = self.last_hop()?;
+        let (hop, cmd) = self.recv_cmd_opt(limit).await?;
+        match cmd {
+            RelayCmd::Error { code, detail } => Err(NetError::Remote { hop, code, detail }),
+            cmd if hop == last => Ok(cmd),
+            _ => Err(NetError::Protocol(
+                "unexpected command from an intermediate hop".into(),
+            )),
+        }
+    }
+
+    /// Turn the circuit into a two-way pipe of `Stream` payloads exchanged
+    /// with the last hop (used after a rendezvous join). The circuit is
+    /// destroyed when either side of the pipe is dropped.
+    pub fn into_stream_pipe(mut self) -> StreamPipe {
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(32);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    outgoing = out_rx.recv() => match outgoing {
+                        Some(bytes) => {
+                            if self.send_to_last(RelayCmd::Stream { bytes }).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                    incoming = self.recv_from_last(None) => match incoming {
+                        Ok(RelayCmd::Stream { bytes }) => {
+                            if in_tx.send(bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => break,
+                        Err(_) => break,
+                    },
+                }
+            }
+            // Dropping `self` sends Destroy unless the circuit is already gone.
+        });
+        StreamPipe {
+            tx: out_tx,
+            rx: in_rx,
+        }
+    }
+
     /// Seal `cmd` for hop `target`, then wrap it once for every hop before it.
     pub fn seal_for(&mut self, target: usize, cmd: RelayCmd) -> Result<Vec<u8>, NetError> {
         let mut cell = self.hops[target]
@@ -245,11 +332,20 @@ impl Circuit {
 
     /// Next message for this circuit from the link.
     pub async fn recv_msg(&mut self, limit: std::time::Duration) -> Result<LinkMsg, NetError> {
-        match timeout(limit, self.rx.recv()).await {
-            Err(_) => Err(NetError::Timeout),
-            Ok(None) => Err(NetError::ConnectionClosed),
-            Ok(Some(msg)) => Ok(msg),
-        }
+        self.recv_msg_opt(Some(limit)).await
+    }
+
+    async fn recv_msg_opt(
+        &mut self,
+        limit: Option<std::time::Duration>,
+    ) -> Result<LinkMsg, NetError> {
+        let received = match limit {
+            Some(limit) => timeout(limit, self.rx.recv())
+                .await
+                .map_err(|_| NetError::Timeout)?,
+            None => self.rx.recv().await,
+        };
+        received.ok_or(NetError::ConnectionClosed)
     }
 
     /// Next backward command, with the index of the hop that sent it.
@@ -257,7 +353,14 @@ impl Circuit {
         &mut self,
         limit: std::time::Duration,
     ) -> Result<(usize, RelayCmd), NetError> {
-        match self.recv_msg(limit).await? {
+        self.recv_cmd_opt(Some(limit)).await
+    }
+
+    async fn recv_cmd_opt(
+        &mut self,
+        limit: Option<std::time::Duration>,
+    ) -> Result<(usize, RelayCmd), NetError> {
+        match self.recv_msg_opt(limit).await? {
             LinkMsg::Relay { cell, .. } => self.peel(cell),
             LinkMsg::Destroy { reason, .. } => {
                 self.destroyed = true;
@@ -300,4 +403,10 @@ impl Drop for Circuit {
             });
         }
     }
+}
+
+/// Two-way channel of end-to-end `Stream` payloads over a joined circuit.
+pub struct StreamPipe {
+    pub tx: mpsc::Sender<Vec<u8>>,
+    pub rx: mpsc::Receiver<Vec<u8>>,
 }

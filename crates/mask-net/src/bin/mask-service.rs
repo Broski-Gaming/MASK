@@ -1,21 +1,21 @@
-//! Create, host, and verify `.morp` services.
+//! Create, host, and verify `.morp` hidden services.
 
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mask_net::address::MorpAddress;
 use mask_net::directory::DEFAULT_DIRECTORY;
 use mask_net::directory::client::DirectoryClient;
+use mask_net::hs::app::serve_site;
+use mask_net::hs::client::{ClientConfig, MorpClient};
+use mask_net::hs::service::{HiddenService, HostConfig};
 use mask_net::identity::to_hex;
-use mask_net::service::descriptor::{
-    DEFAULT_LIFETIME, MAX_LIFETIME, ServiceDescriptor, ServiceEndpoint, Withdrawal,
-};
-use mask_net::service::fetch::{self, FetchTimeouts};
-use mask_net::service::host::ServiceHost;
+use mask_net::service::descriptor::{DEFAULT_LIFETIME, MAX_INTRO_POINTS, MAX_LIFETIME, Withdrawal};
 use mask_net::service::keys::ServiceKeys;
 use mask_net::service::site::Site;
 use mask_net::service::{now_millis, now_secs};
@@ -25,9 +25,9 @@ use tokio::signal::unix::{SignalKind, signal};
 
 const PID_FILE: &str = "host.pid";
 
-/// Manage MORP services. Addresses are generated from keys; they cannot be
-/// chosen. EXPERIMENTAL v0.4: hosting is a direct localhost prototype and
-/// does NOT hide the service's location.
+/// Manage MORP hidden services. Addresses are generated from keys; they
+/// cannot be chosen. EXPERIMENTAL and unreviewed: traffic goes through MORP
+/// relay circuits, but this is not Tor-level anonymity.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
@@ -35,9 +35,13 @@ struct Args {
     #[arg(long, global = true, default_value = "runtime/services")]
     services_dir: PathBuf,
 
-    /// MORP directory address.
+    /// MORP service directory address.
     #[arg(long, global = true, default_value = DEFAULT_DIRECTORY)]
     directory: SocketAddr,
+
+    /// Folder of relay descriptors published by mask-relay.
+    #[arg(long, global = true, default_value = "runtime/directory")]
+    relay_directory: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -53,23 +57,32 @@ enum Command {
     Show { address: String },
     /// Check an address's format and checksum (offline).
     Check { address: String },
-    /// Host a website folder at a service's address until stopped.
+    /// Host a website at a service's address, reachable only through MORP relays.
     Host {
         address: String,
-        /// Folder containing index.html and other files.
+        /// Folder with index.html etc., served by a built-in app on 127.0.0.1.
+        #[arg(long, conflicts_with = "app", required_unless_present = "app")]
+        site: Option<PathBuf>,
+        /// Instead of --site: forward to your own web app on this loopback address.
         #[arg(long)]
-        site: PathBuf,
-        /// Local address for the service (must be loopback; port 0 = any).
-        #[arg(long, default_value = "127.0.0.1:0")]
-        listen: SocketAddr,
+        app: Option<SocketAddr>,
+        /// Number of introduction points (1-3).
+        #[arg(long, default_value_t = 2)]
+        intro_points: usize,
         /// Descriptor lifetime in seconds (republished at a third of this).
         #[arg(long, default_value_t = DEFAULT_LIFETIME)]
         lifetime: u64,
     },
     /// Stop a running `host` for this address.
     Stop { address: String },
-    /// Look the address up in the directory and make the service prove its identity.
+    /// Reach the service through MORP relays and check it proves its identity.
     Verify { address: String },
+    /// Fetch one page through MORP relays and print it (like curl).
+    Fetch {
+        address: String,
+        #[arg(default_value = "/")]
+        path: String,
+    },
 }
 
 #[tokio::main]
@@ -83,21 +96,16 @@ async fn main() -> ExitCode {
         Command::Host {
             ref address,
             ref site,
-            listen,
+            app,
+            intro_points,
             lifetime,
-        } => {
-            host(
-                &args.services_dir,
-                args.directory,
-                address,
-                site,
-                listen,
-                lifetime,
-            )
-            .await
-        }
+        } => host(&args, address, site.as_deref(), app, intro_points, lifetime).await,
         Command::Stop { ref address } => stop(&args.services_dir, address),
-        Command::Verify { ref address } => verify(args.directory, address).await,
+        Command::Verify { ref address } => verify(&args, address).await,
+        Command::Fetch {
+            ref address,
+            ref path,
+        } => fetch_page(&args, address, path).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -164,11 +172,11 @@ fn check(address: &str) -> Result<(), String> {
 }
 
 async fn host(
-    services_dir: &Path,
-    directory: SocketAddr,
+    args: &Args,
     address: &str,
-    site: &Path,
-    listen: SocketAddr,
+    site: Option<&Path>,
+    app: Option<SocketAddr>,
+    intro_points: usize,
     lifetime: u64,
 ) -> Result<(), String> {
     tracing_subscriber::fmt()
@@ -181,63 +189,98 @@ async fn host(
             "--lifetime must be between 1 and {MAX_LIFETIME} seconds"
         ));
     }
+    if !(1..=MAX_INTRO_POINTS).contains(&intro_points) {
+        return Err(format!(
+            "--intro-points must be between 1 and {MAX_INTRO_POINTS}"
+        ));
+    }
     let address = parse(address)?;
-    let keys = ServiceKeys::load_address(services_dir, &address).map_err(|e| e.to_string())?;
-    let site = Site::new(site).map_err(|e| format!("site folder {}: {e}", site.display()))?;
-    let site_root = site.root().to_path_buf();
+    let identity =
+        ServiceKeys::load_address(&args.services_dir, &address).map_err(|e| e.to_string())?;
     let client =
-        DirectoryClient::new(directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let host = ServiceHost::bind(keys, site, listen)
-        .await
-        .map_err(|e| e.to_string())?;
-    let keys = host.keys();
-    let endpoint = ServiceEndpoint::DirectLoopback(host.local_addr());
-    let descriptor =
-        |revision| ServiceDescriptor::sign(&keys, endpoint.clone(), now_secs(), lifetime, revision);
+        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+
+    // The local web application: built-in static site or the user's own app.
+    let (app_addr, app_desc) = match (site, app) {
+        (Some(site), _) => {
+            let site =
+                Site::new(site).map_err(|e| format!("site folder {}: {e}", site.display()))?;
+            let root = site.root().display().to_string();
+            let (addr, _task) = serve_site(site, "127.0.0.1:0".parse().unwrap())
+                .await
+                .map_err(|e| e.to_string())?;
+            (addr, format!("built-in static site from {root}"))
+        }
+        (None, Some(app)) => {
+            if !app.ip().is_loopback() {
+                return Err("--app must be a loopback address such as 127.0.0.1:8080".into());
+            }
+            (app, "your application".to_owned())
+        }
+        (None, None) => return Err("give --site or --app".into()),
+    };
+
+    let mut config = HostConfig::new(args.relay_directory.clone(), app_addr);
+    config.intro_points = intro_points;
+    println!("Building introduction circuits through MORP relays…");
+    let service = HiddenService::start(identity, config).await.map_err(|e| {
+        format!(
+            "{e}\nAre the relays running? Start an entry, a middle, and at least one \
+             rendezvous relay (see README)."
+        )
+    })?;
+    let stats = service.stats();
 
     let mut revision = now_millis();
     client
-        .publish(&descriptor(revision))
+        .publish(&service.descriptor(now_secs(), lifetime, revision))
         .await
         .map_err(|e| format!("{e}\nIs the directory running? Start it with: mask-directory"))?;
 
-    let pid_path = services_dir.join(address.id()).join(PID_FILE);
+    let pid_path = args.services_dir.join(address.id()).join(PID_FILE);
     fs::write(&pid_path, std::process::id().to_string()).map_err(|e| e.to_string())?;
 
-    eprintln!("MORP service — EXPERIMENTAL v0.4 direct localhost prototype.");
-    eprintln!("The service's location is NOT hidden; relays are not used yet.\n");
+    eprintln!("MORP hidden service — EXPERIMENTAL and unreviewed. Not Tor-level anonymity.\n");
     println!("Serving {}", address.url());
-    println!("  site:     {}", site_root.display());
     println!(
-        "  endpoint: {} (published in the descriptor)",
-        host.local_addr()
+        "  introduction points: {} (descriptor lists no address or port)",
+        service.intro_points().len()
     );
+    println!("  local app: {app_addr} ({app_desc}; loopback only, never contacted by clients)");
     println!("Stop with Ctrl+C or: mask-service stop {}", address.id());
 
-    let server = tokio::spawn(host.serve());
     let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut refresh = tokio::time::interval(Duration::from_secs((lifetime / 3).max(1)));
-    refresh.tick().await; // the first tick fires immediately; we just published
-    loop {
+    refresh.tick().await; // fires immediately; we just published
+    let mut health = tokio::time::interval(Duration::from_secs(2));
+    let outcome = loop {
         tokio::select! {
             _ = refresh.tick() => {
                 revision = now_millis().max(revision + 1);
-                if let Err(e) = client.publish(&descriptor(revision)).await {
+                if let Err(e) = client.publish(&service.descriptor(now_secs(), lifetime, revision)).await {
                     tracing::warn!("descriptor refresh failed: {e}");
                 }
             }
-            _ = tokio::signal::ctrl_c() => break,
-            _ = sigterm.recv() => break,
+            _ = health.tick() => {
+                if stats.live_intro_points.load(Ordering::SeqCst) == 0 {
+                    break Err("all introduction circuits were lost (a relay stopped?); restart the host".to_owned());
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = sigterm.recv() => break Ok(()),
         }
-    }
+    };
 
-    println!("\nStopping: withdrawing the descriptor.");
-    server.abort();
-    if let Err(e) = client.withdraw(&Withdrawal::sign(&keys, revision)).await {
+    println!("\nStopping: withdrawing the descriptor and closing circuits.");
+    service.shutdown();
+    if let Err(e) = client
+        .withdraw(&Withdrawal::sign(&service.identity(), revision))
+        .await
+    {
         eprintln!("warning: could not withdraw descriptor: {e}");
     }
     let _ = fs::remove_file(&pid_path);
-    Ok(())
+    outcome
 }
 
 fn stop(services_dir: &Path, address: &str) -> Result<(), String> {
@@ -260,25 +303,60 @@ fn stop(services_dir: &Path, address: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn verify(directory: SocketAddr, address: &str) -> Result<(), String> {
+async fn verify(args: &Args, address: &str) -> Result<(), String> {
     let address = parse(address)?;
     println!("1. Address format and checksum: OK");
-    let client =
-        DirectoryClient::new(directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let descriptor = client
+    let directory =
+        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let descriptor = directory
         .lookup(&address)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no descriptor is published for this address".to_owned())?;
     println!(
-        "2. Descriptor signature by the address's key: OK (revision {}, expires in {} s)",
-        descriptor.revision,
+        "2. Descriptor signed by the address's key: OK ({} introduction point(s), expires in {} s)",
+        descriptor.intro_points.len(),
         descriptor.expires.saturating_sub(now_secs())
     );
-    fetch::connect(&client, &address, FetchTimeouts::default())
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("3. Live service proved possession of the private key: OK");
+    let client = MorpClient::new(directory, ClientConfig::new(args.relay_directory.clone()));
+    let (_session, route) = client.connect(&address).await.map_err(|e| e.to_string())?;
+    println!(
+        "3. Reached through relays (intro point: {}; your circuit: {} → {} → {}): OK",
+        route.intro_point, route.entry, route.middle, route.rendezvous
+    );
+    println!("4. Service proved possession of the private key at the rendezvous: OK");
     println!("\n{} is authentic.", address.url());
     Ok(())
+}
+
+async fn fetch_page(args: &Args, address: &str, path: &str) -> Result<(), String> {
+    let address = parse(address)?;
+    let directory =
+        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let client = MorpClient::new(directory, ClientConfig::new(args.relay_directory.clone()));
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let response = client
+        .fetch(
+            &address,
+            mask_net::hs::session::HttpRequest {
+                method: "GET".into(),
+                path,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "HTTP {} · {} · {} bytes (via MORP relays)",
+        response.status,
+        response.content_type,
+        response.body.len()
+    );
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(&response.body)
+        .map_err(|e| e.to_string())
 }

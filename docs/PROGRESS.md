@@ -93,7 +93,7 @@ Full specification, threat model, and limitations: `docs/MORP.md`.
 Main gaps: links are plain TCP (no TLS/Noise), variable cell sizes,
 trusted local directory, no guard nodes, error details name relays.
 
-## Next
+### Next (as planned after v0.3)
 
 Candidates, one at a time:
 - Authenticated, encrypted links (TLS 1.3 or Noise) and fixed-size cells.
@@ -147,9 +147,72 @@ No names, aliases, DNS, or registration. Recorded in CLAUDE.md.
 loopback endpoint in the descriptor). The directory sees all lookups and
 endpoints. See the threat model.
 
-## Next: v0.5 hidden-service circuits
+## v0.5 — Relay-routed `.morp` hidden services (2026-11-01)
 
-Planned, not started:
-- Introduction points and rendezvous circuits over MORP relays, so the
-  descriptor no longer reveals the service's endpoint.
-- Consider encrypting descriptors so the directory cannot read them.
+Specification and threat model: `docs/MORP_HIDDEN_SERVICES.md`.
+
+**Done (milestones A–F, in order)**
+- A. Rendezvous-role relays (MORP v2); `EstablishIntro` with per-intro
+  Ed25519 auth keys bound to the intro relay; descriptor v2 listing intro
+  points only (no location). The v0.4 direct channel/host/fetch code and the
+  `DirectLoopback` endpoint were removed.
+- B. Client and service build independent entry → middle → rendezvous
+  circuits; relays may extend middle → exit | rendezvous.
+- C. Encrypted introductions (X25519 + HKDF + ChaCha20-Poly1305), single-use
+  rendezvous cookies, circuit joining, service authentication by identity
+  signature, end-to-end session keys; replay and tamper rejection.
+- D. Multiplexed end-to-end session (64 in flight, 32 KiB chunks, 16 MiB cap)
+  forwarded by the host to a loopback-only local app (built-in static site or
+  `--app`).
+- E. MASK Browser `morp://` handler uses relay circuits only, reuses one
+  session per address for all page resources, shows errors on failure; MORP
+  errors are logged to the terminal.
+- F. 17 hidden-service integration tests: resources over relays, separate
+  joined circuits, deny-by-default connection policy proving no direct
+  client → service socket, observer proving no relay saw content/paths,
+  20 parallel requests on one session, lying directory, replayed and
+  tampered introductions, unknown intro key, single-use cookies, missing
+  middle, rendezvous relay disconnect, stopped service, directory down,
+  cleanup of all circuits. Plus browser handler tests on a live relay
+  network, session crypto unit tests, and descriptor v2 tests.
+- Mutation checks: removing the middle → rendezvous permission makes the
+  routing test fail; pointing the observer check at data relays *can* see
+  makes the confidentiality test fail (so both checks are live).
+- Tests: 137 total (19 browser, 73 network unit, 28 MORP end-to-end,
+  17 hidden-service). Network suites ran 10× without failures.
+- `mask-service fetch` (curl-like, via relays) for debugging.
+
+**Bug found during manual testing and fixed**
+- Relays closed any inbound link idle for 300 s, which killed a hidden
+  service's (legitimately quiet) introduction circuits after 5 minutes; the
+  host then withdrew its descriptor. Relays now close idle links only when
+  they carry no circuits. Regression tests added (verified to fail without
+  the fix).
+
+**Manual run (separate processes)**
+- Directory, entry, middle, two rendezvous relays, host for an existing
+  address; `verify` passed through relays; MASK Browser rendered the page
+  and the multi-resource example site (CSS, SVG, JavaScript). `ss` showed
+  the browser's only TCP connections were to the entry relay and the
+  directory, never to the service's local app.
+
+**Open items / observations**
+- During testing, WebKit rendering went blank for a while (also with the
+  committed v0.4 binary, so not a code regression) and later recovered
+  without changes; cause not determined.
+- Once, under XWayland, the browser showed "Service identity could not be
+  verified" before contacting any relay (so at the descriptor step). Not
+  reproduced in 35+ later browser and CLI attempts; the browser now logs the
+  exact error if it recurs.
+- Hosts do not re-establish lost intro points; they exit instead.
+
+**Security status: unreviewed.** All components on one machine; not
+Tor-level anonymity.
+
+## Next
+
+Candidates, one at a time:
+- Re-establish lost intro points; encrypt descriptors / blind keys.
+- Authenticated, encrypted relay links (TLS 1.3 or Noise) and fixed-size cells.
+- Guard relays and path rules; more relays.
+- Browser circuit/status panel.

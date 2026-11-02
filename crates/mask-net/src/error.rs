@@ -31,6 +31,13 @@ pub enum NetError {
     /// MORP currently only runs on loopback addresses.
     NotLoopback(SocketAddr),
     InvalidConfig(String),
+    /// The connection policy refused this connection.
+    PolicyDenied {
+        origin: String,
+        addr: SocketAddr,
+    },
+    /// The component was shut down.
+    Shutdown,
 }
 
 impl fmt::Display for NetError {
@@ -55,6 +62,10 @@ impl fmt::Display for NetError {
                 "{addr} is not a loopback address; MORP currently only runs on 127.0.0.1"
             ),
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),
+            Self::PolicyDenied { origin, addr } => {
+                write!(f, "connection from {origin} to {addr} denied by policy")
+            }
+            Self::Shutdown => write!(f, "shut down"),
         }
     }
 }

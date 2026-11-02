@@ -58,12 +58,18 @@ pub fn from_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
 }
 
 /// The part a node plays on a circuit.
+///
+/// Circuits always run client → entry → middle → (exit | rendezvous).
+/// A **rendezvous**-role relay serves `.morp` hidden services: it can act as
+/// an introduction point and as a rendezvous point. Exits only run the echo
+/// test service; `.morp` traffic never uses them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     Client,
     Entry,
     Middle,
     Exit,
+    Rendezvous,
 }
 
 impl Role {
@@ -72,19 +78,29 @@ impl Role {
         match self {
             Role::Entry => Some(Role::Client),
             Role::Middle => Some(Role::Entry),
-            Role::Exit => Some(Role::Middle),
+            Role::Exit | Role::Rendezvous => Some(Role::Middle),
             Role::Client => None,
         }
     }
 
-    /// The role this node's next hop must have.
-    pub const fn expected_downstream(self) -> Option<Role> {
-        match self {
-            Role::Client => Some(Role::Entry),
-            Role::Entry => Some(Role::Middle),
-            Role::Middle => Some(Role::Exit),
-            Role::Exit => None,
-        }
+    /// May a node of this role open a link to (extend a circuit to) `next`?
+    pub const fn can_extend_to(self, next: Role) -> bool {
+        matches!(
+            (self, next),
+            (Role::Client, Role::Entry)
+                | (Role::Entry, Role::Middle)
+                | (Role::Middle, Role::Exit | Role::Rendezvous)
+        )
+    }
+
+    /// Entry and middle relays extend circuits; the last hop does not.
+    pub const fn extends(self) -> bool {
+        matches!(self, Role::Entry | Role::Middle)
+    }
+
+    /// Roles that may be the last hop of a circuit.
+    pub const fn is_last_hop(self) -> bool {
+        matches!(self, Role::Exit | Role::Rendezvous)
     }
 
     pub const fn is_relay(self) -> bool {
@@ -99,6 +115,7 @@ impl fmt::Display for Role {
             Role::Entry => "entry",
             Role::Middle => "middle",
             Role::Exit => "exit",
+            Role::Rendezvous => "rendezvous",
         })
     }
 }
@@ -111,9 +128,10 @@ impl FromStr for Role {
             "entry" => Ok(Role::Entry),
             "middle" => Ok(Role::Middle),
             "exit" => Ok(Role::Exit),
+            "rendezvous" => Ok(Role::Rendezvous),
             "client" => Ok(Role::Client),
             other => Err(format!(
-                "unknown role \"{other}\" (expected entry, middle, or exit)"
+                "unknown role \"{other}\" (expected entry, middle, exit, or rendezvous)"
             )),
         }
     }
@@ -143,7 +161,12 @@ mod tests {
         assert_eq!(Role::Entry.expected_upstream(), Some(Role::Client));
         assert_eq!(Role::Middle.expected_upstream(), Some(Role::Entry));
         assert_eq!(Role::Exit.expected_upstream(), Some(Role::Middle));
-        assert_eq!(Role::Exit.expected_downstream(), None);
+        assert_eq!(Role::Rendezvous.expected_upstream(), Some(Role::Middle));
+        assert!(Role::Middle.can_extend_to(Role::Exit));
+        assert!(Role::Middle.can_extend_to(Role::Rendezvous));
+        assert!(!Role::Entry.can_extend_to(Role::Rendezvous));
+        assert!(!Role::Rendezvous.extends());
+        assert!(!Role::Exit.extends());
     }
 
     #[test]

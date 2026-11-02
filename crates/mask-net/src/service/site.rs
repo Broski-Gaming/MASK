@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
 
-use super::channel::{MAX_BODY, Request, Response};
+use crate::hs::session::{HttpRequest as Request, HttpResponse as Response, MAX_BODY};
 
 pub struct Site {
     root: PathBuf,

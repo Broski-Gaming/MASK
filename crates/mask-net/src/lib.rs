@@ -26,6 +26,7 @@ pub mod crypto;
 pub mod descriptor;
 pub mod directory;
 pub mod error;
+pub mod hs;
 pub mod identity;
 pub mod protocol;
 pub mod relay;

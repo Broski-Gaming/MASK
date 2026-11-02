@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "mask"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "MASK (Multi-hop Anonymous Service Kit): experimental privacy browser and onion-routing network"
 publish = false
@@ -24,6 +24,8 @@ url = "2.5"
 mask-net = { path = "crates/mask-net" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time"] }
 http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

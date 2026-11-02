@@ -262,3 +262,22 @@ and encrypted links (TLS 1.3 or Noise); fixed-size cells with padding;
 signed, expiring directory information from multiple authorities; guard
 selection; fuzzing of all parsers; and a removal of debugging detail from
 errors. Until then, MASK must not be described as anonymous or secure.
+
+---
+
+## 11. Changes in MORP version 2 (MASK v0.5)
+
+- `MORP_VERSION` is 2; v1 and v2 nodes refuse each other at the link
+  handshake.
+- New relay role **rendezvous**: a last-hop relay (after a middle) that acts
+  as hidden-service introduction point and rendezvous point. Middles may
+  extend to exits or rendezvous relays.
+- New relay commands: `EstablishIntro`, `IntroEstablished`, `Introduce1`,
+  `IntroduceAck`, `Introduce2`, `EstablishRendezvous`,
+  `RendezvousEstablished`, `Rendezvous1`, `Rendezvous2`, `Stream`; new error
+  codes `UnknownService`, `BadCookie`, `Rejected`, `ResourceLimit`. See
+  `docs/MORP_HIDDEN_SERVICES.md`.
+- Idle links are closed only when they carry no circuits (introduction
+  circuits are quiet for long periods).
+- Relays expose statistics, an observer hook for tests, a clean shutdown,
+  and a connection policy that every outbound connection is checked against.

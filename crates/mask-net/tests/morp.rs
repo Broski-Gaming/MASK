@@ -67,7 +67,7 @@ fn descriptor_at(role: Role, addr: SocketAddr) -> RelayDescriptor {
 
 fn with_exit(path: &CircuitPath, exit: RelayDescriptor) -> CircuitPath {
     CircuitPath {
-        exit,
+        last: exit,
         ..path.clone()
     }
 }
@@ -312,7 +312,7 @@ async fn failed_extend_leaves_the_partial_circuit_usable() {
     let dead_middle = descriptor_at(Role::Middle, dead_addr().await);
     assert!(circuit.extend(&dead_middle).await.is_err());
     circuit.extend(&path.middle).await.unwrap();
-    circuit.extend(&path.exit).await.unwrap();
+    circuit.extend(&path.last).await.unwrap();
     assert_eq!(circuit.send(b"recovered").await.unwrap(), b"recovered");
 }
 
@@ -360,7 +360,7 @@ async fn impostor_at_entry_address_is_refused() {
 #[tokio::test]
 async fn client_cannot_link_directly_to_middle_or_exit() {
     let path = start_network().await;
-    for relay in [&path.middle, &path.exit] {
+    for relay in [&path.middle, &path.last] {
         let err = ClientLink::connect(relay, fast()).await.err().unwrap();
         assert!(
             matches!(
@@ -570,9 +570,14 @@ async fn garbage_frame_gets_link_error_and_disconnect() {
     let mut conn = Connection::connect(path.entry.addr, Duration::from_secs(2))
         .await
         .unwrap();
-    handshake_outbound(&mut conn, Role::Client, Role::Entry, Duration::from_secs(2))
-        .await
-        .unwrap();
+    handshake_outbound(
+        &mut conn,
+        Role::Client,
+        &[Role::Entry],
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
     drop(conn);
 
     let mut stream = TcpStream::connect(path.entry.addr).await.unwrap();
@@ -625,4 +630,43 @@ async fn create_before_handshake_is_rejected() {
             ..
         })
     ));
+}
+
+// ========================================================== idle links
+
+async fn start_relay_idle(role: Role, idle: Duration) -> RelayDescriptor {
+    let mut config = RelayConfig::new(role.to_string(), role, "127.0.0.1:0".parse().unwrap());
+    config.timeouts = Timeouts { idle, ..fast() };
+    let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
+    let descriptor = relay.descriptor();
+    tokio::spawn(relay.serve());
+    descriptor
+}
+
+#[tokio::test]
+async fn quiet_links_with_open_circuits_are_not_closed() {
+    // Regression: hidden-service intro circuits are silent for long periods;
+    // the idle timeout must not cut a link that still carries circuits.
+    let idle = Duration::from_millis(300);
+    let path = CircuitPath::new(
+        start_relay_idle(Role::Entry, idle).await,
+        start_relay_idle(Role::Middle, idle).await,
+        start_relay_idle(Role::Exit, idle).await,
+    )
+    .unwrap();
+    let link = ClientLink::connect(&path.entry, fast()).await.unwrap();
+    let mut circuit = link.build_circuit(&path).await.unwrap();
+    tokio::time::sleep(idle * 5).await;
+    assert_eq!(circuit.send(b"still here").await.unwrap(), b"still here");
+}
+
+#[tokio::test]
+async fn idle_links_without_circuits_are_closed() {
+    let idle = Duration::from_millis(300);
+    let entry = start_relay_idle(Role::Entry, idle).await;
+    let link = ClientLink::connect(&entry, fast()).await.unwrap();
+    let mut circuit = link.new_circuit();
+    tokio::time::sleep(idle * 4).await;
+    // The relay has closed the link, so the circuit cannot even be created.
+    assert!(circuit.create(&entry).await.is_err());
 }
