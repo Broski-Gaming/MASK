@@ -1,6 +1,17 @@
 [package]
-name = "MASK"
+name = "mask"
 version = "0.1.0"
 edition = "2024"
+description = "MASK (Multi-hop Anonymous Service Kit): experimental privacy browser and onion-routing network"
+publish = false
+
+[[bin]]
+name = "mask-browser"
+path = "src/main.rs"
 
 [dependencies]
+# GTK3 + WebKitGTK versions must match the ones wry 0.57 is built against.
+gtk = "0.18"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+url = "2.5"
