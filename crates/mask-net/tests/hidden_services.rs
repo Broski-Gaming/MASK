@@ -33,6 +33,7 @@ use mask_net::service::keys::ServiceKeys;
 use mask_net::service::site::Site;
 use mask_net::service::{now_millis, now_secs};
 use mask_net::transport::{ConnectPolicy, Timeouts};
+use mask_net::trust::TrustedRelays;
 
 const SECRET: &str = "TOP-SECRET-PAGE-CONTENT-7f3a";
 
@@ -42,6 +43,7 @@ fn timeouts() -> Timeouts {
         handshake: Duration::from_secs(2),
         response: Duration::from_secs(5),
         idle: Duration::from_secs(30),
+        keepalive: Duration::from_secs(5),
     }
 }
 
@@ -102,6 +104,7 @@ impl Net {
                 config.timeouts = timeouts();
                 config.policy = policy;
                 config.observer = Some(observer);
+                config.trusted = TrustedRelays::from(relay_dir.clone());
                 let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
                 let descriptor = relay.descriptor();
                 descriptor.write_to_dir(&relay_dir).unwrap();

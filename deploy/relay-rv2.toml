@@ -1,0 +1,8 @@
+# Rendezvous-role relay (hidden-service intro + rendezvous point) on machine B.
+# Run: mask-relay --config relay-rv2.toml
+nickname = "rv2"
+role = "rendezvous"
+listen = "192.168.1.11:7104"
+family = "machine-b"
+network = "network.toml"
+data_dir = "/var/lib/mask/relays/rv2"

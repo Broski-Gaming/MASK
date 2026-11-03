@@ -1,6 +1,10 @@
-# MORP — MASK Onion Routing Protocol (version 1, experimental)
+# MORP — MASK Onion Routing Protocol (version 3, experimental)
 
-> **Status: experimental, unreviewed, localhost only.**
+> **Status: experimental, unreviewed. One machine, or a private testnet of
+> machines you control (never public addresses).** Sections 1–10 describe
+> the circuit protocol (unchanged since v1 except where noted); §11 and §12
+> list what versions 2 and 3 changed. Multi-machine operation is described
+> in `docs/DISTRIBUTED_NETWORK.md`.
 > MORP has not been independently reviewed or analysed. It must not be used
 > to protect anyone's identity, communications, or safety. This document
 > describes what it is designed to do and, just as importantly, what it does
@@ -12,7 +16,8 @@ does not invent any cryptographic algorithms. Where MORP follows Tor's
 design this document says so.
 
 Code: `crates/mask-net/` (`crypto/`, `protocol.rs`, `transport.rs`,
-`relay.rs`, `client.rs`, `descriptor.rs`).
+`relay.rs`, `client.rs`, `descriptor.rs`, `trust.rs`, `scope.rs`,
+`authority/`).
 
 ---
 
@@ -39,6 +44,7 @@ Code: `crates/mask-net/` (`crypto/`, `protocol.rs`, `transport.rs`,
 | Layer encryption | ChaCha20-Poly1305 (IETF, 96-bit nonce) | `chacha20poly1305` |
 | Randomness | OS CSPRNG (`getrandom`) | `getrandom` |
 | Secret wiping | `zeroize` on drop for keys | `zeroize` |
+| Link encryption (v3) | Noise `NK` / `IK`, 25519 + ChaCha20-Poly1305 + SHA-256 | `snow` 0.10 (RustCrypto/dalek backends only) |
 
 ## 3. Keys and descriptors
 
@@ -49,39 +55,86 @@ Each relay has:
   The relay refuses to start if the file is readable by group or others. The
   public key is the relay's **node ID**.
 - **Onion key** (X25519). Generated fresh at every start, kept only in memory.
+- **Link key** (X25519, v3). Also fresh each start, memory only; the Noise
+  static key for its links (§4).
 
 At startup a relay signs a **descriptor**:
 
 ```
 signature = Ed25519-Sign(identity_key,
-    "MORP-v1 relay descriptor\0" ||
-    postcard(version, nickname, role, address, node_id, onion_key, published))
+    "MORP-v3 relay descriptor\0" ||
+    postcard(version, nickname, role, address, node_id, onion_key,
+             link_key, family, published))
 ```
 
-and writes it as JSON to the directory folder (default `runtime/directory/`).
-On clean shutdown it deletes its descriptor. Clients load every descriptor,
-verify each signature with `verify_strict`, skip invalid files, and choose
-one entry, one middle, and one exit at random.
+In local mode it writes the descriptor as JSON to the directory folder
+(default `runtime/directory/`) and deletes it on clean shutdown. In network
+mode it uploads it to the directory authorities, which list it in the signed
+consensus (see `docs/DISTRIBUTED_NETWORK.md`). Clients verify every
+signature with `verify_strict`, drop invalid or out-of-scope descriptors,
+and choose a path (§9).
 
 ## 4. Links
 
 A link is one TCP connection between neighbours (client↔entry,
-entry↔middle, middle↔exit).
+entry↔middle, middle↔last hop). Since version 3 **every link is a Noise
+session**; there is no plaintext mode and nothing to negotiate.
 
-**Framing:** every message is `u32 big-endian length || postcard(LinkMsg)`.
-Frames over 64 KiB are rejected before the body is read.
-
-**Link handshake:**
+**Framing:** `u16 big-endian length || bytes` (at most 65 535, the Noise
+message limit).
 
 ```
-opener → acceptor:  Hello   { version: 1, role }
-acceptor → opener:  Welcome { version: 1, role }
+initiator → responder:  kind (1 byte) || Noise message 1
+responder → initiator:  Noise message 2
+then:                   Noise transport messages, each = one postcard(LinkMsg)
+                        of at most 65 519 bytes
+prologue = "MORP link v3\0" || kind      (changing the kind breaks the handshake)
+```
+
+| kind | pattern | used by | authenticated |
+|---|---|---|---|
+| 1 Client | `Noise_NK_25519_ChaChaPoly_SHA256` | client / hidden-service host → entry | responder only (client stays anonymous at the link layer) |
+| 2 Relay | `Noise_IK_25519_ChaChaPoly_SHA256` | relay → next relay | both sides |
+| 3 Probe | NK | authority health checks | responder |
+| 4 Directory | NK | requests to a directory authority | responder |
+
+The responder's static key is its **link key**: an X25519 key generated
+fresh each run and bound to the relay's Ed25519 identity by the signed
+descriptor (authority link keys are pinned in `network.toml`). For IK the
+responder learns the initiator's link key in message 1 and **closes without
+answering** unless it belongs to a trusted relay (§4.1) whose role may open
+that link (an entry may link to a middle; a middle to an exit or rendezvous
+relay). Entries accept client links; middles, exits, and rendezvous relays
+do not.
+
+**MORP handshake (inside Noise):**
+
+```
+opener → acceptor:  Hello   { version: 3, role }
+acceptor → opener:  Welcome { version: 3, role }
                or:  LinkError { code, detail }   and close
 ```
 
-Roles must follow client → entry → middle → exit. The declared role is
-**not authenticated**; it is a sanity check against misconfiguration, not a
-security boundary.
+The declared role must follow client → entry → middle → last hop and, on
+relay links, must equal the role of the relay the Noise handshake
+authenticated.
+
+**Keepalive:** a quiet outbound link sends `Ping { nonce }`; the peer answers
+`Pong`. Two intervals without any message after a `Ping` (default interval
+30 s) mark the link dead, destroying its circuits. This detects machines
+that vanish without closing TCP. Inbound links that carry no circuits close
+after the idle timeout (300 s).
+
+### 4.1 Trusted relays and EXTEND
+
+Each relay has a trusted relay set (`trust.rs`): the descriptor folder (one
+machine) or the relays in the newest valid consensus signed by a pinned
+directory authority (network mode). An `EXTEND` names the next hop's address
+and, inside its CREATE request, its identity. The relay extends only if
+that identity is a trusted relay **published at that address**, inside the
+network scope, not itself, and of a role it may extend to; otherwise it
+answers `Error(ExtendRejected)`. A relay cannot be used to connect to
+arbitrary hosts.
 
 **Link messages:**
 
@@ -90,8 +143,9 @@ security boundary.
 | `Create { circ, request }` | Open circuit `circ` on this link (ntor handshake). |
 | `Created { circ, reply }` | Handshake reply. |
 | `Relay { circ, cell }` | One onion cell. Away from the client on a relay's inbound link, toward the client on its outbound link. |
-| `Destroy { circ, reason }` | Tear down `circ`. |
+| `Destroy { circ, reason }` | Tear down `circ` (authenticated by the link). |
 | `LinkError { code, detail }` | Fatal link error, then close. |
+| `Ping { nonce }` / `Pong { nonce }` | Keepalive (v3). |
 
 **Circuit IDs** are random non-zero `u32`s chosen by the side that opened the
 link, unique on that link. A relay maps `(inbound link, inbound ID)` to
@@ -227,14 +281,17 @@ handshake, response, and idle timeouts.
 - **Traffic analysis by size.** Cells are variable-length and shrink by one
   layer at each hop, so message sizes and each relay's position are
   visible. There are no fixed-size cells, padding, or cover traffic.
-- **Link-level attackers.** Links are plain TCP, not TLS. An observer of a
-  link sees circuit IDs, cell sizes, timing, and handshake public keys, and
-  can inject `Destroy` messages or close the link (denial of service).
-  Cell contents remain encrypted and authenticated.
-- **A malicious directory.** Whoever can write to the directory folder
-  chooses which relays (and keys) clients use. There are no directory
-  authorities, consensus, or descriptor expiry.
-- **Sybil attacks.** Nothing limits how many relays one party runs.
+- **Link-level traffic analysis.** Since v3 links are Noise-encrypted and
+  authenticated, so a network attacker can no longer read circuit IDs,
+  impersonate a relay, or inject `Destroy`. It still sees connection
+  endpoints, frame sizes, and timing, and can drop or delay traffic
+  (denial of service).
+- **A malicious directory.** In local mode whoever can write to the
+  descriptor folder chooses the relays. In network mode a single compromised
+  directory authority can list relays it controls (there is no multi-
+  authority vote or threshold signature yet).
+- **Sybil attacks.** In network mode only allowlisted identities are
+  admitted, but the operator who writes the allowlist controls every relay.
 - **Denial of service.** The limits are basic, there is no
   congestion control, and one slow next hop can delay other extensions.
 - **The client's own machine, or the destination.** The exit currently runs
@@ -246,10 +303,11 @@ handshake, response, and idle timeouts.
 
 ## 9. Known limitations (implementation)
 
-- Localhost only: relays refuse to listen on, or extend to, non-loopback
-  addresses.
-- Exactly three hops with fixed roles; path selection is uniform random per
-  role with no guard nodes, families, or bandwidth weighting.
+- Network scope `loopback` (default) or `private`; public addresses are
+  always refused for listening, advertising, extending, and accepting.
+- Exactly three hops with fixed roles; path selection prefers three
+  different families and avoids recently failed relays, but there are no
+  guard nodes or bandwidth weighting.
 - One outstanding request per circuit; no streams or flow control.
 - Onion keys rotate only when a relay restarts; descriptors have no expiry.
 - Error details reveal relay names (debugging aid).
@@ -257,11 +315,11 @@ handshake, response, and idle timeouts.
 
 ## 10. Before MORP could be trusted
 
-At minimum: an independent cryptographic and protocol review; authenticated
-and encrypted links (TLS 1.3 or Noise); fixed-size cells with padding;
-signed, expiring directory information from multiple authorities; guard
-selection; fuzzing of all parsers; and a removal of debugging detail from
-errors. Until then, MASK must not be described as anonymous or secure.
+At minimum: an independent cryptographic and protocol review; fixed-size
+cells with padding; consensus documents agreed and signed by several
+independent authorities; guard selection; fuzzing of all parsers; and a
+removal of debugging detail from errors. (Authenticated, encrypted links
+were added in version 3.) Until then, MASK must not be described as anonymous or secure.
 
 ---
 
@@ -281,3 +339,26 @@ errors. Until then, MASK must not be described as anonymous or secure.
   circuits are quiet for long periods).
 - Relays expose statistics, an observer hook for tests, a clean shutdown,
   and a connection policy that every outbound connection is checked against.
+
+## 12. Changes in MORP version 3 (MASK v0.6)
+
+- `MORP_VERSION` is 3. Links are Noise sessions (§4); a v2 (plaintext) peer
+  is closed after its first frame without an answer.
+- Relay descriptors (`"MORP-v3 relay descriptor\0"`) also sign a per-run
+  **link key** and an operator-chosen **family** (machine label). Nicknames
+  and families are `a-z 0-9 - _`, at most 32 characters. Roles are written
+  in lowercase in JSON and TOML.
+- Relays accept relay links and extend only to relays in their trusted set
+  (§4.1). Clients reach only entry relays.
+- Network scope (`scope.rs`): `loopback` or `private` (RFC 1918, 100.64/10,
+  fc00::/7, loopback). Public, unspecified (`0.0.0.0`), link-local, and
+  multicast addresses are refused everywhere.
+- Directory authorities and signed consensus documents (`authority/`); see
+  `docs/DISTRIBUTED_NETWORK.md`.
+- Keepalives (`Ping`/`Pong`), per-IP and total link limits, `DestroyReason::
+  RelayShutdown`, and `LinkErrorCode::{Unauthenticated, ResourceLimit}`.
+- Graceful shutdown: on SIGINT/SIGTERM a relay destroys every circuit,
+  telling both neighbours, flushes, and closes its links.
+- Paths choose the entry and middle together, preferring three distinct
+  families, and skip relays that failed in the last 60 s; circuit builds are
+  retried on fresh paths.

@@ -10,15 +10,18 @@
 //!
 //! The service never accepts inbound connections for MORP traffic; its only
 //! listening socket is the local application on 127.0.0.1.
+//!
+//! When an introduction circuit is lost (a relay or machine went away),
+//! [`HiddenService::replenish`] establishes a replacement at another
+//! rendezvous-role relay; the caller then republishes the descriptor.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -27,21 +30,21 @@ use super::crypto::{IntroKeys, accept_introduction, open_introduction};
 use super::session::{self, Handler, HttpRequest};
 use crate::NetError;
 use crate::address::MorpAddress;
-use crate::client::{Circuit, ClientLink};
-use crate::descriptor::Directory;
-use crate::identity::Role;
+use crate::client::{Circuit, build_circuit_to};
+use crate::identity::{NodeId, Role};
 use crate::protocol::RelayCmd;
 use crate::service::descriptor::{IntroPoint, MAX_INTRO_POINTS, ServiceDescriptor};
 use crate::service::keys::ServiceKeys;
 use crate::transport::{ConnectPolicy, Timeouts};
+use crate::trust::TrustedRelays;
 
 /// Remembered client ephemeral keys (replay protection), per service run.
 const MAX_SEEN_INTRODUCTIONS: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
-    /// Folder of relay descriptors.
-    pub relay_directory: PathBuf,
+    /// Where relays come from: a local folder or a signed consensus.
+    pub relays: TrustedRelays,
     /// The local web application (loopback only).
     pub app: SocketAddr,
     pub intro_points: usize,
@@ -53,9 +56,10 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    pub fn new(relay_directory: PathBuf, app: SocketAddr) -> Self {
+    /// `relays`: a [`TrustedRelays`], or a folder path (local mode).
+    pub fn new(relays: impl Into<TrustedRelays>, app: SocketAddr) -> Self {
         Self {
-            relay_directory,
+            relays: relays.into(),
             app,
             intro_points: 2,
             timeouts: Timeouts::default(),
@@ -76,6 +80,8 @@ pub struct HostStats {
     pub active_sessions: AtomicUsize,
     pub requests: AtomicU64,
     pub live_intro_points: AtomicUsize,
+    /// Introduction points re-established after one was lost.
+    pub intro_points_replaced: AtomicU64,
 }
 
 struct Ctx {
@@ -86,12 +92,16 @@ struct Ctx {
     seen: Mutex<HashSet<[u8; 32]>>,
     sessions: Arc<Semaphore>,
     shutdown: CancellationToken,
+    /// Live introduction points (what the descriptor should list).
+    intros: Mutex<Vec<IntroPoint>>,
+    wanted: usize,
+    /// Fires when an introduction point is lost.
+    intro_lost: Notify,
 }
 
 /// A running hidden service.
 pub struct HiddenService {
     ctx: Arc<Ctx>,
-    intro_points: Vec<IntroPoint>,
 }
 
 impl HiddenService {
@@ -99,14 +109,15 @@ impl HiddenService {
     /// Publishing the descriptor is up to the caller (see [`descriptor`]).
     ///
     /// [`descriptor`]: HiddenService::descriptor
-    pub async fn start(identity: ServiceKeys, config: HostConfig) -> Result<Self, NetError> {
+    pub async fn start(identity: ServiceKeys, mut config: HostConfig) -> Result<Self, NetError> {
         let wanted = config.intro_points.clamp(1, MAX_INTRO_POINTS);
+        config.policy = config.policy.with_scope(config.relays.scope());
         let forwarder = Arc::new(AppForwarder::new(
             config.app,
             config.policy.clone(),
             config.app_timeout,
         )?);
-        let (relays, _) = Directory::load(&config.relay_directory)?;
+        config.relays.snapshot()?;
 
         let ctx = Arc::new(Ctx {
             identity: Arc::new(identity),
@@ -116,59 +127,108 @@ impl HiddenService {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             shutdown: CancellationToken::new(),
             config,
+            intros: Mutex::new(Vec::new()),
+            wanted,
+            intro_lost: Notify::new(),
         });
+        let service = Self { ctx };
+        if let Err(e) = service.replenish().await
+            && service.ctx.intros.lock().unwrap().is_empty()
+        {
+            service.ctx.shutdown.cancel();
+            return Err(e);
+        }
+        Ok(service)
+    }
 
-        let mut intro_points = Vec::new();
-        let mut used = Vec::new();
+    /// Establish introduction points until the configured number are live.
+    /// Returns how many were added; the caller should republish the
+    /// descriptor if that is more than zero. Errors only if none could be
+    /// added while some were missing.
+    pub async fn replenish(&self) -> Result<usize, NetError> {
+        let ctx = &self.ctx;
+        let mut added = 0;
+        let mut tried: Vec<NodeId> = Vec::new();
         let mut last_error = None;
-        while intro_points.len() < wanted {
-            let Some(relay) = relays.random_relay(Role::Rendezvous, &used) else {
+        loop {
+            let current: Vec<NodeId> = ctx
+                .intros
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|ip| ip.relay)
+                .collect();
+            if current.len() >= ctx.wanted || ctx.shutdown.is_cancelled() {
                 break;
-            };
-            if used.contains(&relay.node_id) {
-                break; // no unused rendezvous-role relays left
             }
-            used.push(relay.node_id);
             let keys = IntroKeys::generate();
-            match establish_intro(&ctx, &relays, &relay, &keys).await {
-                Ok(circuit) => {
-                    info!(intro = %relay.nickname, "introduction point established");
-                    intro_points.push(IntroPoint {
-                        relay: relay.node_id,
+            let avoid: Vec<NodeId> = current.iter().chain(&tried).copied().collect();
+            let attempt = establish_intro(ctx, &avoid, &keys).await;
+            match attempt {
+                Ok((circuit, relay, nickname)) => {
+                    info!(intro = %nickname, "introduction point established");
+                    ctx.intros.lock().unwrap().push(IntroPoint {
+                        relay,
                         auth_key: keys.auth_public(),
                         enc_key: keys.enc_public(),
                     });
                     ctx.stats.live_intro_points.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(intro_listener(Arc::clone(&ctx), circuit, Arc::new(keys)));
+                    tokio::spawn(intro_listener(
+                        Arc::clone(ctx),
+                        circuit,
+                        Arc::new(keys),
+                        relay,
+                    ));
+                    added += 1;
+                    tried.push(relay);
                 }
-                Err(e) => {
-                    warn!(intro = %relay.nickname, error = %e, "introduction point failed");
+                Err((e, relay)) => {
+                    warn!(error = %e, "introduction point failed");
                     last_error = Some(e);
+                    match relay {
+                        Some(relay) if !tried.contains(&relay) => tried.push(relay),
+                        _ => break, // no untried rendezvous-role relay left
+                    }
                 }
             }
         }
-        if intro_points.is_empty() {
-            ctx.shutdown.cancel();
-            return Err(last_error.unwrap_or_else(|| {
-                NetError::InvalidConfig("no rendezvous-role relays in the relay directory".into())
-            }));
+        if added == 0
+            && let Some(e) = last_error
+        {
+            return Err(e);
         }
-        Ok(Self { ctx, intro_points })
+        Ok(added)
+    }
+
+    /// Resolves when an introduction point is lost.
+    pub async fn intro_point_lost(&self) {
+        self.ctx.intro_lost.notified().await;
+    }
+
+    /// Number of live introduction points.
+    pub fn live_intro_points(&self) -> usize {
+        self.ctx.intros.lock().unwrap().len()
+    }
+
+    /// How many introduction points this service tries to keep.
+    pub fn wanted_intro_points(&self) -> usize {
+        self.ctx.wanted
     }
 
     pub fn address(&self) -> &MorpAddress {
         self.ctx.identity.address()
     }
 
-    pub fn intro_points(&self) -> &[IntroPoint] {
-        &self.intro_points
+    /// The live introduction points.
+    pub fn intro_points(&self) -> Vec<IntroPoint> {
+        self.ctx.intros.lock().unwrap().clone()
     }
 
-    /// A signed descriptor listing this service's introduction points.
+    /// A signed descriptor listing this service's live introduction points.
     pub fn descriptor(&self, now: u64, lifetime: u64, revision: u64) -> ServiceDescriptor {
         ServiceDescriptor::sign(
             &self.ctx.identity,
-            self.intro_points.clone(),
+            self.intro_points(),
             now,
             lifetime,
             revision,
@@ -195,21 +255,45 @@ impl Drop for HiddenService {
     }
 }
 
+/// Build a circuit to an unused rendezvous-role relay and register `keys`
+/// there. On failure, also returns the relay that was tried (if any).
 async fn establish_intro(
     ctx: &Ctx,
-    relays: &Directory,
-    relay: &crate::descriptor::RelayDescriptor,
+    avoid: &[NodeId],
     keys: &IntroKeys,
-) -> Result<Circuit, NetError> {
-    let path = relays.path_ending_at(relay)?;
-    let link = ClientLink::connect_with(
-        &path.entry,
+) -> Result<(Circuit, NodeId, String), (NetError, Option<NodeId>)> {
+    let directory = ctx.config.relays.snapshot().map_err(|e| (e, None))?;
+    let available = directory
+        .relays()
+        .iter()
+        .any(|d| d.role == Role::Rendezvous && !avoid.contains(&d.node_id));
+    if !available {
+        return Err((
+            NetError::InvalidConfig(
+                "no unused rendezvous-role relay in the relay directory".into(),
+            ),
+            None,
+        ));
+    }
+    let chosen = Mutex::new(None);
+    let built = build_circuit_to(
+        &ctx.config.relays,
+        |directory, unhealthy| {
+            let pick = directory
+                .pick(Role::Rendezvous, avoid, &[], unhealthy)
+                .filter(|d| !avoid.contains(&d.node_id));
+            *chosen.lock().unwrap() = pick.as_ref().map(|d| d.node_id);
+            pick
+        },
         ctx.config.timeouts,
         &ctx.config.policy,
         "service",
+        3,
     )
-    .await?;
-    let mut circuit = link.build_circuit(&path).await?;
+    .await;
+    let relay_tried = *chosen.lock().unwrap();
+    let (_link, mut circuit, path) = built.map_err(|e| (e, relay_tried))?;
+    let relay = path.last;
     let reply = circuit
         .request(
             RelayCmd::EstablishIntro {
@@ -218,14 +302,18 @@ async fn establish_intro(
             },
             ctx.config.timeouts.handshake,
         )
-        .await?;
+        .await
+        .map_err(|e| (e, Some(relay.node_id)))?;
     match reply {
-        RelayCmd::IntroEstablished => Ok(circuit),
-        _ => Err(NetError::Protocol("expected IntroEstablished".into())),
+        RelayCmd::IntroEstablished => Ok((circuit, relay.node_id, relay.nickname)),
+        _ => Err((
+            NetError::Protocol("expected IntroEstablished".into()),
+            Some(relay.node_id),
+        )),
     }
 }
 
-async fn intro_listener(ctx: Arc<Ctx>, mut circuit: Circuit, keys: Arc<IntroKeys>) {
+async fn intro_listener(ctx: Arc<Ctx>, mut circuit: Circuit, keys: Arc<IntroKeys>, relay: NodeId) {
     loop {
         let received = tokio::select! {
             received = circuit.recv_from_last(None) => received,
@@ -247,7 +335,16 @@ async fn intro_listener(ctx: Arc<Ctx>, mut circuit: Circuit, keys: Arc<IntroKeys
             }
         }
     }
+    let auth = keys.auth_public();
+    ctx.intros.lock().unwrap().retain(|ip| ip.auth_key != auth);
     ctx.stats.live_intro_points.fetch_sub(1, Ordering::SeqCst);
+    if !ctx.shutdown.is_cancelled() {
+        ctx.config
+            .relays
+            .health()
+            .mark_failed(relay, crate::trust::DEFAULT_PENALTY);
+        ctx.intro_lost.notify_one();
+    }
 }
 
 async fn handle_introduction(ctx: Arc<Ctx>, keys: Arc<IntroKeys>, payload: Vec<u8>) {
@@ -279,23 +376,25 @@ async fn handle_introduction(ctx: Arc<Ctx>, keys: Arc<IntroKeys>, payload: Vec<u
     };
 
     let setup = async {
-        let (relays, _) = Directory::load(&ctx.config.relay_directory)?;
-        let rendezvous = relays
+        let rendezvous = ctx
+            .config
+            .relays
             .find(&intro.rendezvous)
             .filter(|d| d.role == Role::Rendezvous)
-            .cloned()
             .ok_or_else(|| {
                 NetError::InvalidConfig("client asked for an unknown rendezvous relay".into())
             })?;
-        let path = relays.path_ending_at(&rendezvous)?;
-        let link = ClientLink::connect_with(
-            &path.entry,
+        // The service's own, separate circuit to the client's rendezvous
+        // point (fresh entry and middle; retried on another path if needed).
+        let (_link, mut circuit, _path) = build_circuit_to(
+            &ctx.config.relays,
+            |_, _| Some(rendezvous.clone()),
             ctx.config.timeouts,
             &ctx.config.policy,
             "service",
+            3,
         )
         .await?;
-        let mut circuit = link.build_circuit(&path).await?;
         let (reply, session_keys) = accept_introduction(&ctx.identity, &intro)?;
         circuit
             .send_to_last(RelayCmd::Rendezvous1 {

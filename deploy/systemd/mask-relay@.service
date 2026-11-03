@@ -1,0 +1,37 @@
+# MORP relay, one instance per config: /etc/mask/relay-<name>.toml
+#   sudo systemctl enable --now mask-relay@entry1
+# The relay.toml must use data_dir = "/var/lib/mask/relays/<name>".
+[Unit]
+Description=MASK MORP relay %i (experimental, private testnet)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mask-relay --config /etc/mask/relay-%i.toml
+DynamicUser=yes
+StateDirectory=mask/relays/%i
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+# SIGTERM: destroy circuits, tell neighbours, close links.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

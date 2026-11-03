@@ -1,0 +1,16 @@
+# Entry relay on machine A. Run: mask-relay --config relay-entry1.toml
+nickname = "entry1"                 # a-z 0-9 - _ ; must be in approved-relays.toml
+role = "entry"                      # entry | middle | rendezvous | exit
+listen = "192.168.1.10:7101"        # bind to this machine's private address
+# advertise = "192.168.1.10:7101"   # only if others must use a different address
+family = "machine-a"                # same label for every relay on this machine
+network = "network.toml"
+data_dir = "/var/lib/mask/relays/entry1"   # identity.key (0600)
+consensus_refresh_secs = 30          # fetch the consensus this often (2-3600)
+keepalive_secs = 30                  # ping quiet relay links this often (1-600)
+
+[limits]                            # optional; defaults shown
+max_links = 2048
+max_links_per_ip = 256
+max_circuits = 4096
+max_circuits_per_link = 128

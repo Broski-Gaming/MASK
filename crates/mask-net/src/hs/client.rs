@@ -12,10 +12,14 @@
 //!
 //! There is no other way to reach a service: no direct connection, no DNS,
 //! no fallback. Sessions are reused for later requests to the same address.
+//!
+//! In network mode (v0.6) relays come from the signed consensus, refreshed
+//! from the directory authorities when stale, and descriptors are looked up
+//! at the authorities over Noise links. Relays that fail are avoided for a
+//! while and the rendezvous circuit is retried on a fresh path.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,13 +29,15 @@ use super::crypto::ClientIntro;
 use super::session::{ClientSession, HttpRequest, HttpResponse, SessionError};
 use crate::NetError;
 use crate::address::MorpAddress;
-use crate::client::ClientLink;
+use crate::client::build_circuit_to;
 use crate::crypto::random_bytes;
-use crate::descriptor::{CircuitPath, Directory};
-use crate::directory::client::{DirectoryClient, LookupError};
+use crate::descriptor::CircuitPath;
+use crate::directory::ServiceDirectory;
+use crate::directory::client::LookupError;
 use crate::identity::Role;
 use crate::protocol::{ErrorCode, RelayCmd};
 use crate::transport::{ConnectPolicy, Timeouts};
+use crate::trust::TrustedRelays;
 
 /// Most cached sessions (one per address).
 const MAX_SESSIONS: usize = 32;
@@ -40,7 +46,8 @@ type SessionSlot = Arc<tokio::sync::Mutex<Option<ClientSession>>>;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    pub relay_directory: PathBuf,
+    /// Where relays come from: a local folder or a signed consensus.
+    pub relays: TrustedRelays,
     pub timeouts: Timeouts,
     pub policy: ConnectPolicy,
     /// Time allowed for the whole connection setup.
@@ -51,9 +58,10 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    pub fn new(relay_directory: PathBuf) -> Self {
+    /// `relays`: a [`TrustedRelays`], or a folder path (local mode).
+    pub fn new(relays: impl Into<TrustedRelays>) -> Self {
         Self {
-            relay_directory,
+            relays: relays.into(),
             timeouts: Timeouts::default(),
             policy: ConnectPolicy::allow_all(),
             connect_timeout: Duration::from_secs(45),
@@ -112,15 +120,18 @@ pub struct SessionRoute {
 /// Fetches pages from `.morp` services over relay circuits.
 #[derive(Clone)]
 pub struct MorpClient {
-    directory: DirectoryClient,
+    directory: ServiceDirectory,
     config: Arc<ClientConfig>,
     sessions: Arc<Mutex<HashMap<MorpAddress, SessionSlot>>>,
 }
 
 impl MorpClient {
-    pub fn new(directory: DirectoryClient, config: ClientConfig) -> Self {
+    /// `directory`: the local HTTP directory or the network's authorities.
+    /// The connection policy is confined to the relays' network scope.
+    pub fn new(directory: impl Into<ServiceDirectory>, mut config: ClientConfig) -> Self {
+        config.policy = config.policy.with_scope(config.relays.scope());
         Self {
-            directory,
+            directory: directory.into(),
             config: Arc::new(config),
             sessions: Arc::default(),
         }
@@ -201,28 +212,45 @@ impl MorpClient {
             Err(LookupError::Invalid(why)) => return Err(FetchError::DescriptorInvalid(why)),
         };
 
-        // 2. Rendezvous circuit.
-        let (relays, _) = Directory::load(&config.relay_directory)
+        // 2. Rendezvous circuit: a random rendezvous-role relay that is not
+        // one of the service's intro points, on a fresh path, with retries.
+        if let Some(authorities) = self.directory.authorities() {
+            authorities
+                .refresh_if_needed(&config.relays)
+                .await
+                .map_err(|e| FetchError::RelaysUnavailable(e.to_string()))?;
+        }
+        let relays = config
+            .relays
+            .snapshot()
             .map_err(|e| FetchError::RelaysUnavailable(e.to_string()))?;
         let intro_relays: Vec<_> = descriptor.intro_points.iter().map(|ip| ip.relay).collect();
-        let rendezvous = relays
-            .random_relay(Role::Rendezvous, &intro_relays)
-            .ok_or_else(|| FetchError::RelaysUnavailable("no rendezvous-role relay".into()))?;
-        let rp_path = relays
-            .path_ending_at(&rendezvous)
-            .map_err(|e| FetchError::RelaysUnavailable(e.to_string()))?;
+        if !relays.relays().iter().any(|d| d.role == Role::Rendezvous) {
+            return Err(FetchError::RelaysUnavailable(
+                "no rendezvous-role relay".into(),
+            ));
+        }
         let circuit_err = |stage: &str| {
             let stage = stage.to_owned();
             move |e: NetError| FetchError::CircuitFailed(format!("{stage}: {e}"))
         };
-        let link =
-            ClientLink::connect_with(&rp_path.entry, config.timeouts, &config.policy, "client")
-                .await
-                .map_err(circuit_err("connecting to entry relay"))?;
-        let mut rp_circuit = link
-            .build_circuit(&rp_path)
-            .await
-            .map_err(circuit_err("building rendezvous circuit"))?;
+        let (link, mut rp_circuit, rp_path) = build_circuit_to(
+            &config.relays,
+            |directory, unhealthy| {
+                // Never a relay known to be failing (if any other exists);
+                // preferably not one of the service's intro points.
+                directory
+                    .pick(Role::Rendezvous, unhealthy, &[], &intro_relays)
+                    .or_else(|| directory.random_relay(Role::Rendezvous, &intro_relays))
+            },
+            config.timeouts,
+            &config.policy,
+            "client",
+            3,
+        )
+        .await
+        .map_err(circuit_err("building rendezvous circuit"))?;
+        let rendezvous = rp_path.last.clone();
         let cookie: [u8; 32] = random_bytes();
         match rp_circuit
             .request(
@@ -244,7 +272,7 @@ impl MorpClient {
         let mut introduced = None;
         let mut problems = Vec::new();
         for ip in &descriptor.intro_points {
-            let Some(intro_relay) = relays.find(&ip.relay).cloned() else {
+            let Some(intro_relay) = config.relays.find(&ip.relay) else {
                 problems.push("intro relay not in relay directory".to_owned());
                 continue;
             };

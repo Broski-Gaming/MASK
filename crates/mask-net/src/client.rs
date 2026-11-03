@@ -14,19 +14,23 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::crypto::ntor::ClientHandshake;
 use crate::crypto::onion::{CellCipher, Direction};
-use crate::descriptor::{CircuitPath, RelayDescriptor};
+use crate::descriptor::{CircuitPath, Directory, RelayDescriptor};
 use crate::error::NetError;
-use crate::identity::Role;
+use crate::identity::{NodeId, Role};
 use crate::protocol::{
-    CircId, DestroyReason, LayerBody, LinkMsg, MAX_DATA_LEN, RelayCmd, decode, encode,
+    CircId, DestroyReason, ErrorCode, LayerBody, LinkMsg, MAX_DATA_LEN, RelayCmd, decode, encode,
 };
-use crate::transport::{ConnectPolicy, Connection, Link, LinkReader, Timeouts, handshake_outbound};
+use crate::transport::{
+    ConnectPolicy, Connection, Link, LinkKind, LinkReader, Timeouts, WeakLink, handshake_outbound,
+};
+use crate::trust::{DEFAULT_PENALTY, TrustedRelays};
 
 type Routes = Arc<Mutex<HashMap<CircId, mpsc::Sender<LinkMsg>>>>;
 
@@ -51,15 +55,31 @@ impl ClientLink {
         policy: &ConnectPolicy,
         origin: &str,
     ) -> Result<Self, NetError> {
-        if !entry.addr.ip().is_loopback() {
-            return Err(NetError::NotLoopback(entry.addr));
+        if entry.role != Role::Entry {
+            return Err(NetError::InvalidConfig(format!(
+                "{} is a {} relay; clients connect only to entry relays",
+                entry.nickname, entry.role
+            )));
         }
-        let mut conn =
-            Connection::connect_checked(entry.addr, timeouts.connect, policy, origin).await?;
+        let mut conn = Connection::connect_checked(
+            entry.addr,
+            LinkKind::Client,
+            &entry.link_key,
+            None,
+            &timeouts,
+            policy,
+            origin,
+        )
+        .await?;
         handshake_outbound(&mut conn, Role::Client, &[Role::Entry], timeouts.handshake).await?;
         let (link, reader) = conn.into_link();
         let routes: Routes = Arc::default();
-        tokio::spawn(dispatch(reader, Arc::clone(&routes)));
+        tokio::spawn(dispatch(
+            reader,
+            link.downgrade(),
+            Arc::clone(&routes),
+            timeouts.keepalive,
+        ));
         Ok(Self {
             link,
             entry: entry.clone(),
@@ -113,13 +133,44 @@ impl ClientLink {
     }
 }
 
-/// Route each incoming message to its circuit by circuit ID.
-async fn dispatch(mut reader: LinkReader, routes: Routes) {
-    while let Ok(Some(msg)) = reader.recv(None).await {
+/// Route each incoming message to its circuit by circuit ID, answer
+/// keepalives, and ping the entry when the link is quiet. A link whose entry
+/// stops answering is closed, which fails every circuit on it.
+async fn dispatch(mut reader: LinkReader, link: WeakLink, routes: Routes, keepalive: Duration) {
+    let mut unanswered = 0u32;
+    loop {
+        let msg = match reader.recv(Some(keepalive)).await {
+            Ok(Some(msg)) => {
+                unanswered = 0;
+                msg
+            }
+            Err(NetError::Timeout) => {
+                // Nobody uses the link any more: let it close.
+                let Some(link) = link.upgrade() else { break };
+                if unanswered >= 2 {
+                    tracing::warn!(entry = %link.peer_addr(), "entry relay stopped answering keepalives");
+                    break;
+                }
+                unanswered += 1;
+                let nonce = u64::from_le_bytes(crate::crypto::random_bytes::<8>());
+                if link.send(LinkMsg::Ping { nonce }).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Ok(None) | Err(_) => break,
+        };
         let circ = match &msg {
             LinkMsg::Created { circ, .. }
             | LinkMsg::Relay { circ, .. }
             | LinkMsg::Destroy { circ, .. } => *circ,
+            LinkMsg::Ping { nonce } => {
+                if let Some(link) = link.upgrade() {
+                    let _ = link.send(LinkMsg::Pong { nonce: *nonce }).await;
+                }
+                continue;
+            }
+            LinkMsg::Pong { .. } => continue,
             _ => break,
         };
         let tx = routes.lock().unwrap().get(&circ).cloned();
@@ -409,4 +460,82 @@ impl Drop for Circuit {
 pub struct StreamPipe {
     pub tx: mpsc::Sender<Vec<u8>>,
     pub rx: mpsc::Receiver<Vec<u8>>,
+}
+
+/// Which relay, if any, a circuit-building error points at.
+fn blame(path: &CircuitPath, error: &NetError, connected: bool) -> Option<NodeId> {
+    if !connected {
+        return Some(path.entry.node_id);
+    }
+    match error {
+        // Hop `hop` could not reach (or was refused by) the next one.
+        NetError::Remote {
+            hop,
+            code: ErrorCode::NextHopUnreachable | ErrorCode::ExtendRejected | ErrorCode::Timeout,
+            ..
+        } => path.hops().get(hop + 1).map(|d| d.node_id),
+        NetError::Crypto(_) | NetError::Remote { .. } => None,
+        // The entry stopped answering.
+        NetError::Timeout | NetError::ConnectionClosed => Some(path.entry.node_id),
+        _ => None,
+    }
+}
+
+/// Build a three-hop circuit ending at a relay picked by `choose_last`,
+/// retrying up to `attempts` times with fresh paths. Relays that fail are
+/// marked in the trusted set's [`Health`](crate::trust::Health) so later
+/// paths (here and elsewhere in the process) avoid them for a while.
+///
+/// `choose_last(directory, unhealthy)` picks the last hop.
+pub async fn build_circuit_to(
+    trusted: &TrustedRelays,
+    choose_last: impl Fn(&Directory, &[NodeId]) -> Option<RelayDescriptor>,
+    timeouts: Timeouts,
+    policy: &ConnectPolicy,
+    origin: &str,
+    attempts: usize,
+) -> Result<(ClientLink, Circuit, CircuitPath), NetError> {
+    let health = trusted.health();
+    let mut last_error = None;
+    for attempt in 1..=attempts.max(1) {
+        let directory = trusted.snapshot()?;
+        let unhealthy = health.unhealthy();
+        let Some(last) = choose_last(&directory, &unhealthy) else {
+            return Err(last_error.unwrap_or_else(|| {
+                NetError::InvalidConfig("no suitable last-hop relay is available".into())
+            }));
+        };
+        let path = directory.path_avoiding(&last, &unhealthy)?;
+        let outcome = match ClientLink::connect_with(&path.entry, timeouts, policy, origin).await {
+            Ok(link) => match link.build_circuit(&path).await {
+                Ok(circuit) => Ok((link, circuit)),
+                Err(e) => Err((e, true)),
+            },
+            Err(e) => Err((e, false)),
+        };
+        match outcome {
+            Ok((link, circuit)) => {
+                for hop in path.hops() {
+                    health.mark_ok(&hop.node_id);
+                }
+                return Ok((link, circuit, path));
+            }
+            Err((e, connected)) => {
+                if let Some(bad) = blame(&path, &e, connected) {
+                    let nickname = path
+                        .hops()
+                        .into_iter()
+                        .find(|d| d.node_id == bad)
+                        .map(|d| d.nickname.clone())
+                        .unwrap_or_default();
+                    tracing::warn!(attempt, relay = %nickname, error = %e, "circuit failed; avoiding relay for a while");
+                    health.mark_failed(bad, DEFAULT_PENALTY);
+                } else {
+                    tracing::warn!(attempt, error = %e, "circuit failed");
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.expect("at least one attempt"))
 }

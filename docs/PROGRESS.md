@@ -267,3 +267,94 @@ TOML configs, Noise-authenticated links bound to relay identities, directory
 authorities with signed threshold consensus and a relay allowlist,
 cross-machine path rules and guards, intro point re-establishment, and a
 documented LAN trial on 2–5 machines. Not started.
+
+## v0.6 — distributed MORP network (2026-11-02)
+
+**Result: implemented and verified on one machine** (multiple processes and
+Linux network namespaces). A run on separate physical machines is still to
+be recorded. Unreviewed; not anonymous. Starting point: v0.5 re-verified
+first (commit `80550c6`, clean tree, 141 tests passing).
+
+**What was built** (details: `docs/DISTRIBUTED_NETWORK.md`, `docs/MORP.md` §4, §12)
+- **Network scope** (`scope.rs`): `loopback` or `private` (RFC 1918,
+  100.64/10, fc00::/7); public, unspecified, link-local, and multicast
+  addresses refused for listen, advertise, extend, authority, and accepted
+  peers. Applied through `ConnectPolicy` to every outbound connection.
+- **Noise links** (`transport.rs`, `snow` 0.10 with RustCrypto/dalek
+  backends only): NK for clients/probes/directory requests, IK between
+  relays. Per-run link keys signed into descriptor v3. No plaintext mode.
+  MORP protocol version 3.
+- **Trust** (`trust.rs`): relays accept relay links and extend only to
+  relays in their trusted set (folder in local mode, signed consensus in
+  network mode), at the published address; nickname → identity pinning;
+  relay health (failed relays avoided for 60 s).
+- **Directory authority** (`authority/`, `mask-authority`): allowlist
+  (`approved-relays.toml`) binding nickname → identity + role, identity
+  changes refused, Noise health probes, signed expiring consensus with
+  sequence numbers (rollback refused), `.morp` service directory over Noise.
+- **Config files** (`config.rs`, `deploy/`): `network.toml` (trust anchor
+  with pinned authority keys), `relay.toml`, `authority.toml`,
+  `approved-relays.toml`; strict parsing; hardened systemd units; nftables
+  example.
+- **Operations**: keepalives (Ping/Pong) detect vanished machines; total and
+  per-IP link limits; graceful SIGINT/SIGTERM shutdown (circuits destroyed
+  with `RelayShutdown`, links flushed and closed); consensus refresh early on
+  lookup misses; `mask-authority status`.
+- **Paths**: entry and middle chosen together for three distinct families;
+  circuit builds retried on fresh paths avoiding failed relays.
+- **Hidden services**: hosts re-establish lost intro points at another
+  rendezvous relay and republish (v0.5 open item closed). Browser network
+  mode via `MASK_NETWORK=network.toml`; `mask-service --network`.
+- Local single-machine mode still works (now also over Noise links); the
+  user's existing `.morp` address was fetched and verified unchanged.
+
+**Bugs found and fixed during development**
+- Client keepalives held a strong link handle, so client links would never
+  close and the entry's idle timer would never fire → dispatcher now holds
+  a weak handle.
+- Relay shutdown inside a running process left half-open sockets (peers
+  sent CREATE into a zombie link) → links now have an explicit close that
+  flushes queued messages and closes the socket even if other handles
+  remain.
+- Rendezvous choice preferred "not an intro relay" over "not known to be
+  failing" → unhealthy relays are now excluded first.
+- Path selection could pick a middle that left no family-distinct entry
+  (seen in the namespace run: entry2 and middle2 on the same machine) →
+  entry and middle chosen jointly.
+
+**Verification**
+
+| Check | Evidence | Result |
+|---|---|---|
+| `cargo fmt`, `check`, `clippy --all-targets` | clean, 0 warnings | Pass |
+| `cargo test --workspace` | **194 passed, 0 failed**, 1 opt-in (19 browser, 110 network unit, 32 MORP, 17 hidden-service, 3 malicious-relay, 12 testnet, 1 multi-process); stable over repeated runs (testnet suite 20/20) | Pass |
+| Multi-process testnet | `tests/processes.rs`: authority + 4 relays + host + client as separate processes from TOML configs; fetch + verify; clean SIGTERM exits; withdrawn service unreachable | Pass |
+| Network namespaces | `scripts/netns-testnet.sh` (also `cargo test --test netns -- --ignored`): 6 namespaces on a bridge; **all 14 checks passed**, including client with no route to the service, service listening only on loopback, page fetched and service verified, rendezvous join, no page content in any relay/authority log, machine cut without FIN → authority dropped its relays, keepalives fired, site still loaded; clean SIGTERM shutdown | Pass |
+| Browser across namespaces | MASK Browser in the client namespace (`--browser`) loaded the `.morp` page through relays: window title showed the page's `<title>` ("Hello from svc via MORP"); its only TCP connection was to entry1 (10.77.0.11:7101); log "MORP session established rendezvous=rv2 intro=rv1" | Pass (see note) |
+| No direct connections | connection-policy logs (testnet), routing isolation (netns), `ss` (browser) | Pass |
+| Mutation tests | breaking the IK trust check, authority identity check, extend trust check, consensus signer check, client identity pins, keepalive limit, or extend scope check each makes its test fail | Pass |
+| Local mode regression | user's own address `tx5y5…` hosted with the README commands: fetch HTTP 200 (422 bytes) and verify through relays; all processes exited 0 on SIGTERM; descriptor folder cleaned | Pass |
+
+**Note — blank WebKit rendering:** during this session every WebKit page
+area painted blank (window titles proved pages loaded). The committed v0.5
+browser, built from `80550c6`, showed the same blank page in the same test,
+so this is the machine's existing WebKitGTK/NVIDIA issue (seen before in
+v0.5), not a v0.6 regression. `WEBKIT_DISABLE_COMPOSITING_MODE=1` did not
+help.
+
+**Limitations (v0.6)**
+- Single-authority signing: no votes or threshold signatures; a compromised
+  authority can list its own relays.
+- No entry guards; descriptor lookups are not routed through circuits.
+- Variable cell sizes, no padding; one operator runs everything: no
+  anonymity.
+- Not yet run on separate physical machines (procedure in
+  `docs/DISTRIBUTED_NETWORK.md` §4–§5).
+
+## Next
+
+- LAN trial on real machines, recorded here.
+- Then (v0.7 candidates): multiple authorities with threshold signatures,
+  entry guards, fixed-size cells and padding, circuit-routed descriptor
+  lookups, encrypted/blinded descriptors, introduction rate limits, browser
+  circuit status panel, fuzzing, and an external review.

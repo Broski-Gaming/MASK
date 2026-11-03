@@ -1,13 +1,15 @@
-//! Signed relay descriptors and the local directory.
+//! Signed relay descriptors and path selection.
 //!
-//! A descriptor binds a relay's address, role, and current onion key to its
-//! Ed25519 identity with a signature. Relays write theirs to a directory
-//! folder at startup; clients load that folder, verify every signature, and
-//! pick a path.
+//! A descriptor binds a relay's address, role, family, current onion key,
+//! and current link key to its Ed25519 identity with a signature.
 //!
-//! The directory folder itself is trusted: whoever can write to it chooses
-//! which relays clients use. That is acceptable for a single-machine
-//! prototype and is listed as a limitation in docs/MORP.md.
+//! Where descriptors come from depends on the mode (see [`crate::trust`]):
+//! - **local** (one machine): relays write theirs to a folder, which is
+//!   trusted completely (whoever can write to it chooses the relays);
+//! - **network** (v0.6): relays upload them to directory authorities, which
+//!   admit only allowlisted identities and sign a consensus.
+//!
+//! Either way every descriptor's own signature is verified before use.
 
 use std::fs;
 use std::io::Write;
@@ -24,7 +26,21 @@ use crate::crypto::keys::RelayKeys;
 use crate::identity::{NodeId, Role, from_hex, to_hex};
 use crate::protocol::MORP_VERSION;
 
-const SIGNING_DOMAIN: &[u8] = b"MORP-v1 relay descriptor\0";
+const SIGNING_DOMAIN: &[u8] = b"MORP-v3 relay descriptor\0";
+
+/// Longest family label (an operator-chosen name for one machine).
+pub const MAX_FAMILY_LEN: usize = 32;
+/// Longest nickname.
+pub const MAX_NICKNAME_LEN: usize = 32;
+
+/// Nicknames and families: 1-32 characters of `a-z 0-9 - _` (families may
+/// also be empty, meaning "a family of its own").
+pub fn valid_label(label: &str, max: usize) -> bool {
+    label.len() <= max
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayDescriptor {
@@ -33,6 +49,11 @@ pub struct RelayDescriptor {
     pub addr: SocketAddr,
     pub node_id: NodeId,
     pub onion_key: [u8; 32],
+    /// X25519 static key for Noise link handshakes (fresh each run).
+    pub link_key: [u8; 32],
+    /// Operator-assigned machine label. Paths avoid putting two hops from
+    /// the same family on one circuit. Empty: a family of its own.
+    pub family: String,
     /// Unix time (seconds) when the descriptor was signed.
     pub published: u64,
     signature: [u8; 64],
@@ -47,7 +68,23 @@ struct Signed<'a> {
     addr: SocketAddr,
     node_id: &'a NodeId,
     onion_key: &'a [u8; 32],
+    link_key: &'a [u8; 32],
+    family: &'a str,
     published: u64,
+}
+
+/// Compact binary form, used inside signed consensus documents.
+#[derive(Serialize, Deserialize)]
+struct DescriptorWire {
+    nickname: String,
+    role: Role,
+    addr: SocketAddr,
+    node_id: NodeId,
+    onion_key: [u8; 32],
+    link_key: [u8; 32],
+    family: String,
+    published: u64,
+    signature: Vec<u8>,
 }
 
 /// On-disk JSON form.
@@ -59,12 +96,25 @@ struct DescriptorFile {
     address: SocketAddr,
     identity: String,
     onion_key: String,
+    link_key: String,
+    #[serde(default)]
+    family: String,
     published: u64,
     signature: String,
 }
 
 impl RelayDescriptor {
     pub fn sign(keys: &RelayKeys, nickname: &str, role: Role, addr: SocketAddr) -> Self {
+        Self::sign_with_family(keys, nickname, role, addr, "")
+    }
+
+    pub fn sign_with_family(
+        keys: &RelayKeys,
+        nickname: &str,
+        role: Role,
+        addr: SocketAddr,
+        family: &str,
+    ) -> Self {
         let published = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -75,6 +125,8 @@ impl RelayDescriptor {
             addr,
             node_id: keys.node_id(),
             onion_key: keys.onion_public(),
+            link_key: keys.link_public(),
+            family: family.to_owned(),
             published,
             signature: [0; 64],
         };
@@ -90,6 +142,8 @@ impl RelayDescriptor {
             addr: self.addr,
             node_id: &self.node_id,
             onion_key: &self.onion_key,
+            link_key: &self.link_key,
+            family: &self.family,
             published: self.published,
         };
         let mut bytes = SIGNING_DOMAIN.to_vec();
@@ -99,6 +153,12 @@ impl RelayDescriptor {
 
     /// Check the signature against the descriptor's own identity key.
     pub fn verify(&self) -> Result<(), CryptoError> {
+        if !valid_label(&self.nickname, MAX_NICKNAME_LEN)
+            || self.nickname.is_empty()
+            || !valid_label(&self.family, MAX_FAMILY_LEN)
+        {
+            return Err(CryptoError::BadSignature);
+        }
         let key = VerifyingKey::from_bytes(self.node_id.as_bytes())
             .map_err(|_| CryptoError::BadSignature)?;
         let signature = Signature::from_bytes(&self.signature);
@@ -114,10 +174,61 @@ impl RelayDescriptor {
             address: self.addr,
             identity: to_hex(self.node_id.as_bytes()),
             onion_key: to_hex(&self.onion_key),
+            link_key: to_hex(&self.link_key),
+            family: self.family.clone(),
             published: self.published,
             signature: to_hex(&self.signature),
         };
         serde_json::to_string_pretty(&file).expect("descriptor serializes")
+    }
+
+    /// Compact binary encoding (for consensus documents).
+    pub fn to_wire(&self) -> Vec<u8> {
+        crate::protocol::encode(&DescriptorWire {
+            nickname: self.nickname.clone(),
+            role: self.role,
+            addr: self.addr,
+            node_id: self.node_id,
+            onion_key: self.onion_key,
+            link_key: self.link_key,
+            family: self.family.clone(),
+            published: self.published,
+            signature: self.signature.to_vec(),
+        })
+    }
+
+    /// Decode and verify a binary descriptor.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, NetError> {
+        let wire: DescriptorWire = crate::protocol::decode(bytes)
+            .map_err(|e| NetError::Descriptor(format!("malformed descriptor: {e}")))?;
+        let descriptor = Self {
+            nickname: wire.nickname,
+            role: wire.role,
+            addr: wire.addr,
+            node_id: wire.node_id,
+            onion_key: wire.onion_key,
+            link_key: wire.link_key,
+            family: wire.family,
+            published: wire.published,
+            signature: wire
+                .signature
+                .try_into()
+                .map_err(|_| NetError::Descriptor("malformed signature".into()))?,
+        };
+        descriptor.verify().map_err(|_| {
+            NetError::Descriptor(format!("bad signature on {}", descriptor.nickname))
+        })?;
+        Ok(descriptor)
+    }
+
+    /// The family used for path diversity: the declared one, or the relay's
+    /// own identity if none was declared.
+    pub fn family_key(&self) -> String {
+        if self.family.is_empty() {
+            format!("id:{}", self.node_id)
+        } else {
+            self.family.clone()
+        }
     }
 
     /// Parse and verify a descriptor.
@@ -137,6 +248,8 @@ impl RelayDescriptor {
             addr: file.address,
             node_id: NodeId::from_bytes(from_hex(&file.identity).ok_or_else(|| bad("identity"))?),
             onion_key: from_hex(&file.onion_key).ok_or_else(|| bad("onion_key"))?,
+            link_key: from_hex(&file.link_key).ok_or_else(|| bad("link_key"))?,
+            family: file.family,
             published: file.published,
             signature: from_hex(&file.signature).ok_or_else(|| bad("signature"))?,
         };
@@ -210,9 +323,6 @@ impl CircuitPath {
                     d.nickname, d.role
                 )));
             }
-            if !d.addr.ip().is_loopback() {
-                return Err(NetError::NotLoopback(d.addr));
-            }
         }
         let ids = [path.entry.node_id, path.middle.node_id, path.last.node_id];
         if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
@@ -272,20 +382,41 @@ impl Directory {
         &self.relays
     }
 
-    /// A uniformly random relay with `role`, avoiding `avoid` if possible.
-    pub fn random_relay(&self, role: Role, avoid: &[NodeId]) -> Option<RelayDescriptor> {
-        let all: Vec<_> = self.relays.iter().filter(|d| d.role == role).collect();
-        let preferred: Vec<_> = all
+    /// A uniformly random relay with `role`. Relays in `avoid` (identities)
+    /// are never chosen; relays whose family is in `avoid_families` or that
+    /// are in `unhealthy` are skipped unless nothing else is left.
+    pub fn pick(
+        &self,
+        role: Role,
+        avoid: &[NodeId],
+        avoid_families: &[String],
+        unhealthy: &[NodeId],
+    ) -> Option<RelayDescriptor> {
+        let all: Vec<&RelayDescriptor> = self
+            .relays
+            .iter()
+            .filter(|d| d.role == role && !avoid.contains(&d.node_id))
+            .collect();
+        let healthy: Vec<_> = all
             .iter()
             .copied()
-            .filter(|d| !avoid.contains(&d.node_id))
+            .filter(|d| !unhealthy.contains(&d.node_id))
             .collect();
-        let pool = if preferred.is_empty() { all } else { preferred };
-        if pool.is_empty() {
-            return None;
-        }
+        let diverse: Vec<_> = healthy
+            .iter()
+            .copied()
+            .filter(|d| !avoid_families.contains(&d.family_key()))
+            .collect();
+        let pool = [diverse, healthy, all]
+            .into_iter()
+            .find(|pool| !pool.is_empty())?;
         let index = u64::from_le_bytes(crate::crypto::random_bytes::<8>()) as usize % pool.len();
         Some(pool[index].clone())
+    }
+
+    /// A uniformly random relay with `role`, avoiding `avoid` if possible.
+    pub fn random_relay(&self, role: Role, avoid: &[NodeId]) -> Option<RelayDescriptor> {
+        self.pick(role, &[], &[], avoid)
     }
 
     /// The relay with this identity, if the directory has it.
@@ -293,17 +424,66 @@ impl Directory {
         self.relays.iter().find(|d| d.node_id == *node_id)
     }
 
-    /// Random entry and middle, ending at `last`.
-    pub fn path_ending_at(&self, last: &RelayDescriptor) -> Result<CircuitPath, NetError> {
+    /// Random entry and middle, ending at `last`, preferring three different
+    /// families and avoiding `unhealthy` relays when possible.
+    ///
+    /// Entry and middle are chosen together, uniformly among all pairs in
+    /// the best available tier: (1) healthy and three distinct families,
+    /// (2) healthy, (3) any. Picking them one at a time could take the only
+    /// middle that leaves a family-distinct entry.
+    pub fn path_avoiding(
+        &self,
+        last: &RelayDescriptor,
+        unhealthy: &[NodeId],
+    ) -> Result<CircuitPath, NetError> {
         let missing =
             |role: Role| NetError::InvalidConfig(format!("no {role} relay in the directory"));
-        let entry = self
-            .random_relay(Role::Entry, &[])
-            .ok_or_else(|| missing(Role::Entry))?;
-        let middle = self
-            .random_relay(Role::Middle, &[])
+        let of_role = |role: Role| -> Vec<&RelayDescriptor> {
+            self.relays
+                .iter()
+                .filter(|d| d.role == role && d.node_id != last.node_id)
+                .collect()
+        };
+        let entries = of_role(Role::Entry);
+        let middles = of_role(Role::Middle);
+        if entries.is_empty() {
+            return Err(missing(Role::Entry));
+        }
+        if middles.is_empty() {
+            return Err(missing(Role::Middle));
+        }
+        let last_family = last.family_key();
+        let pairs: Vec<(&RelayDescriptor, &RelayDescriptor)> = entries
+            .iter()
+            .flat_map(|e| middles.iter().map(move |m| (*e, *m)))
+            .filter(|(e, m)| e.node_id != m.node_id)
+            .collect();
+        let healthy = |d: &RelayDescriptor| !unhealthy.contains(&d.node_id);
+        let healthy_pairs: Vec<_> = pairs
+            .iter()
+            .copied()
+            .filter(|(e, m)| healthy(e) && healthy(m))
+            .collect();
+        let diverse: Vec<_> = healthy_pairs
+            .iter()
+            .copied()
+            .filter(|(e, m)| {
+                let (fe, fm) = (e.family_key(), m.family_key());
+                fe != fm && fe != last_family && fm != last_family
+            })
+            .collect();
+        let pool = [diverse, healthy_pairs, pairs]
+            .into_iter()
+            .find(|pool| !pool.is_empty())
             .ok_or_else(|| missing(Role::Middle))?;
-        CircuitPath::new(entry, middle, last.clone())
+        let index = u64::from_le_bytes(crate::crypto::random_bytes::<8>()) as usize % pool.len();
+        let (entry, middle) = pool[index];
+        CircuitPath::new(entry.clone(), middle.clone(), last.clone())
+    }
+
+    /// Random entry and middle, ending at `last`.
+    pub fn path_ending_at(&self, last: &RelayDescriptor) -> Result<CircuitPath, NetError> {
+        self.path_avoiding(last, &[])
     }
 
     /// Random entry → middle → exit path (echo test service).
@@ -354,6 +534,14 @@ mod tests {
         new_role.role = Role::Exit;
         assert!(new_role.verify().is_err());
 
+        let mut new_link_key = d.clone();
+        new_link_key.link_key = other.link_public();
+        assert!(new_link_key.verify().is_err());
+
+        let mut new_family = d.clone();
+        new_family.family = "elsewhere".into();
+        assert!(new_family.verify().is_err());
+
         let mut bad_sig = d.clone();
         bad_sig.signature_mut()[10] ^= 1;
         assert!(bad_sig.verify().is_err());
@@ -387,6 +575,114 @@ mod tests {
         assert_eq!(problems.len(), 1);
         let path = directory.choose_path().unwrap();
         assert_eq!(path.middle.role, Role::Middle);
+    }
+
+    #[test]
+    fn wire_form_round_trips_and_detects_tampering() {
+        let keys = RelayKeys::generate();
+        let d = RelayDescriptor::sign_with_family(
+            &keys,
+            "middle",
+            Role::Middle,
+            "10.0.0.2:7102".parse().unwrap(),
+            "machine-b",
+        );
+        assert_eq!(RelayDescriptor::from_wire(&d.to_wire()).unwrap(), d);
+        let mut bytes = d.to_wire();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert!(RelayDescriptor::from_wire(&bytes).is_err());
+    }
+
+    #[test]
+    fn invalid_labels_are_refused() {
+        let keys = RelayKeys::generate();
+        let addr = "127.0.0.1:7101".parse().unwrap();
+        assert!(
+            RelayDescriptor::sign(&keys, "Entry One", Role::Entry, addr)
+                .verify()
+                .is_err()
+        );
+        assert!(
+            RelayDescriptor::sign_with_family(&keys, "entry", Role::Entry, addr, "../x")
+                .verify()
+                .is_err()
+        );
+        assert!(
+            RelayDescriptor::sign(&keys, "entry-1", Role::Entry, addr)
+                .verify()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn paths_prefer_three_families_and_skip_unhealthy_relays() {
+        let fam = |role: Role, port: u16, family: &str| {
+            RelayDescriptor::sign_with_family(
+                &RelayKeys::generate(),
+                &format!("{role}{port}"),
+                role,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                family,
+            )
+        };
+        let rv = fam(Role::Rendezvous, 7104, "a");
+        let same_entry = fam(Role::Entry, 7101, "a");
+        let other_entry = fam(Role::Entry, 7111, "c");
+        let same_middle = fam(Role::Middle, 7102, "a");
+        let other_middle = fam(Role::Middle, 7112, "b");
+        let directory = Directory::from_descriptors(vec![
+            rv.clone(),
+            same_entry.clone(),
+            other_entry.clone(),
+            same_middle,
+            other_middle.clone(),
+        ])
+        .unwrap();
+        for _ in 0..20 {
+            let path = directory.path_ending_at(&rv).unwrap();
+            assert_eq!(path.middle.node_id, other_middle.node_id);
+            assert_eq!(path.entry.node_id, other_entry.node_id);
+        }
+        // The diverse entry is unhealthy: fall back to the other one.
+        let path = directory
+            .path_avoiding(&rv, &[other_entry.node_id])
+            .unwrap();
+        assert_eq!(path.entry.node_id, same_entry.node_id);
+    }
+
+    #[test]
+    fn entry_and_middle_are_chosen_together_for_family_diversity() {
+        // The netns layout: entries on m1 and m3, middles on m2 and m3, the
+        // last hop on m1. Only entry(m3) + middle(m2) gives three families;
+        // choosing the middle first could pick middle(m3) and get stuck.
+        let fam = |role: Role, nick: &str, family: &str| {
+            RelayDescriptor::sign_with_family(
+                &RelayKeys::generate(),
+                nick,
+                role,
+                "127.0.0.1:7000".parse().unwrap(),
+                family,
+            )
+        };
+        let rv1 = fam(Role::Rendezvous, "rv1", "m1");
+        let entry1 = fam(Role::Entry, "entry1", "m1");
+        let entry2 = fam(Role::Entry, "entry2", "m3");
+        let middle1 = fam(Role::Middle, "middle1", "m2");
+        let middle2 = fam(Role::Middle, "middle2", "m3");
+        let directory = Directory::from_descriptors(vec![
+            rv1.clone(),
+            entry1,
+            entry2.clone(),
+            middle1.clone(),
+            middle2,
+        ])
+        .unwrap();
+        for _ in 0..50 {
+            let path = directory.path_ending_at(&rv1).unwrap();
+            assert_eq!(path.entry.node_id, entry2.node_id);
+            assert_eq!(path.middle.node_id, middle1.node_id);
+        }
     }
 
     #[test]

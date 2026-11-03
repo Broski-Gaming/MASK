@@ -2,9 +2,10 @@
 //!
 //! Two levels:
 //!
-//! 1. [`LinkMsg`]: what travels on one TCP link between neighbours, one
-//!    postcard-encoded message per length-prefixed frame. Visible to anyone
-//!    who can observe the link (links are not yet encrypted).
+//! 1. [`LinkMsg`]: what travels on one link between neighbours, one
+//!    postcard-encoded message per Noise transport frame (see
+//!    [`crate::transport`]). Links are encrypted and authenticated, so an
+//!    observer sees only frame sizes and timing.
 //! 2. [`LayerBody`]: the plaintext of one onion layer, sealed with that hop's
 //!    key and carried in `LinkMsg::Relay { cell }`. A hop that opens its
 //!    layer finds either another sealed cell to pass along
@@ -19,10 +20,11 @@ use crate::crypto::ntor::{CreateReply, CreateRequest};
 use crate::identity::Role;
 
 /// MORP protocol version, checked in the link handshake.
-pub const MORP_VERSION: u16 = 2;
+pub const MORP_VERSION: u16 = 3;
 
-/// Largest frame accepted on any link.
-pub const MAX_FRAME_LEN: usize = 64 * 1024;
+/// Largest encoded [`LinkMsg`] (the plaintext of one Noise transport
+/// message: 65 535 bytes minus the 16-byte authentication tag).
+pub const MAX_FRAME_LEN: usize = 65_535 - 16;
 
 /// Largest application payload a client may send in one DATA command,
 /// leaving room for three layers of headers and tags inside one frame.
@@ -36,11 +38,20 @@ pub type CircId = u32;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkMsg {
     /// First message from the side opening the link.
-    Hello { version: u16, role: Role },
+    Hello {
+        version: u16,
+        role: Role,
+    },
     /// Reply to an acceptable `Hello`.
-    Welcome { version: u16, role: Role },
+    Welcome {
+        version: u16,
+        role: Role,
+    },
     /// Fatal link-level error, sent just before closing the link.
-    LinkError { code: LinkErrorCode, detail: String },
+    LinkError {
+        code: LinkErrorCode,
+        detail: String,
+    },
 
     /// Open circuit `circ` on this link with an ntor handshake.
     Create {
@@ -48,12 +59,29 @@ pub enum LinkMsg {
         request: CreateRequest,
     },
     /// Handshake reply for `circ`.
-    Created { circ: CircId, reply: CreateReply },
+    Created {
+        circ: CircId,
+        reply: CreateReply,
+    },
     /// One onion cell on `circ`. Direction is implied by the link: away from
     /// the client on a relay's inbound link, toward it on an outbound link.
-    Relay { circ: CircId, cell: Vec<u8> },
-    /// Tear down `circ`. Not authenticated (see docs/MORP.md).
-    Destroy { circ: CircId, reason: DestroyReason },
+    Relay {
+        circ: CircId,
+        cell: Vec<u8>,
+    },
+    /// Tear down `circ`. Authenticated by the link (Noise), so only the
+    /// neighbour on this link can send it.
+    Destroy {
+        circ: CircId,
+        reason: DestroyReason,
+    },
+    /// Keepalive: the peer must answer with `Pong` carrying the same nonce.
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +90,10 @@ pub enum LinkErrorCode {
     BadHandshake,
     RoleNotAllowed,
     Malformed,
+    /// The peer did not authenticate as a trusted relay.
+    Unauthenticated,
+    /// The node has too many links.
+    ResourceLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +109,8 @@ pub enum DestroyReason {
     Timeout,
     LinkClosed,
     ResourceLimit,
+    /// The relay is shutting down.
+    RelayShutdown,
 }
 
 /// Plaintext of one onion layer.

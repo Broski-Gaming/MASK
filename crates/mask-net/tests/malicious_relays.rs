@@ -28,6 +28,7 @@ use mask_net::service::keys::ServiceKeys;
 use mask_net::service::site::Site;
 use mask_net::service::{now_millis, now_secs};
 use mask_net::transport::{ConnectPolicy, Timeouts};
+use mask_net::trust::TrustedRelays;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -42,6 +43,7 @@ fn timeouts() -> Timeouts {
         handshake: Duration::from_secs(2),
         response: Duration::from_secs(4),
         idle: Duration::from_secs(30),
+        keepalive: Duration::from_secs(5),
     }
 }
 
@@ -118,6 +120,7 @@ async fn world() -> World {
         let mut config = RelayConfig::new(nick, role, "127.0.0.1:0".parse().unwrap());
         config.timeouts = timeouts();
         config.policy = policy.clone();
+        config.trusted = TrustedRelays::from(relay_dir.clone());
         let proxy = if role == Role::Rendezvous {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             config.advertise = Some(listener.local_addr().unwrap());

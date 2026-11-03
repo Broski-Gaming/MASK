@@ -24,6 +24,15 @@
 //!
 //! Links to the next relay are shared by every circuit going there, and
 //! circuit IDs keep them apart.
+//!
+//! **Links (v0.6).** Every link is a Noise session (see [`crate::transport`]).
+//! Clients reach only entry relays (NK). Relay → relay links use IK, and the
+//! accepting relay refuses any initiator whose link key is not a relay in
+//! its [`TrustedRelays`] with the role allowed to open that link. A relay
+//! extends only to relays it trusts, found by the identity in the client's
+//! handshake, at the address in their signed descriptor, and inside the
+//! network scope; arbitrary addresses are refused. Outbound links send
+//! keepalive pings so a vanished machine is noticed even if TCP is not.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -33,7 +42,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::crypto::CryptoError;
@@ -46,9 +57,12 @@ use crate::identity::{NodeId, Role};
 use crate::protocol::{
     CircId, DestroyReason, ErrorCode, LayerBody, LinkErrorCode, LinkMsg, RelayCmd, decode, encode,
 };
+use crate::scope::NetworkScope;
 use crate::transport::{
-    ConnectPolicy, Connection, Link, LinkReader, Timeouts, handshake_inbound, handshake_outbound,
+    ConnectPolicy, Connection, Link, LinkKind, LinkReader, Timeouts, handshake_inbound,
+    handshake_outbound,
 };
+use crate::trust::TrustedRelays;
 
 /// Largest introduction payload accepted.
 const MAX_INTRO_PAYLOAD: usize = 4096;
@@ -63,6 +77,10 @@ pub struct Limits {
     pub pending_rendezvous: usize,
     /// How long a rendezvous cookie stays valid.
     pub rendezvous_timeout: Duration,
+    /// Inbound links (connections) open at once, including handshakes.
+    pub max_links: usize,
+    /// Inbound links open at once from one IP address.
+    pub max_links_per_ip: usize,
 }
 
 impl Default for Limits {
@@ -73,6 +91,8 @@ impl Default for Limits {
             intro_points: 256,
             pending_rendezvous: 1024,
             rendezvous_timeout: Duration::from_secs(60),
+            max_links: 2048,
+            max_links_per_ip: 256,
         }
     }
 }
@@ -102,9 +122,15 @@ pub struct RelayConfig {
     pub policy: ConnectPolicy,
     pub observer: Option<Observer>,
     /// Address published in the descriptor, if different from the bound
-    /// address (for example behind port forwarding). Must be loopback in
-    /// this version. `None` publishes the bound address.
+    /// address (for example behind port forwarding). Must be inside the
+    /// scope. `None` publishes the bound address.
     pub advertise: Option<SocketAddr>,
+    /// Which addresses this relay may bind, publish, accept, and extend to.
+    pub scope: NetworkScope,
+    /// Operator-assigned machine label published in the descriptor.
+    pub family: String,
+    /// Relays this relay accepts links from and extends to.
+    pub trusted: TrustedRelays,
 }
 
 impl RelayConfig {
@@ -118,6 +144,9 @@ impl RelayConfig {
             policy: ConnectPolicy::allow_all(),
             observer: None,
             advertise: None,
+            scope: NetworkScope::Loopback,
+            family: String::new(),
+            trusted: TrustedRelays::fixed(NetworkScope::Loopback),
         }
     }
 }
@@ -151,6 +180,13 @@ pub struct RelayStats {
     pub rendezvous_joins: u64,
     /// Stream cells re-sealed from one joined circuit to the other.
     pub stream_cells: u64,
+    /// Inbound links currently open.
+    pub open_links: usize,
+    /// Connections refused: outside the scope, over a limit, or failing
+    /// Noise authentication.
+    pub links_refused: u64,
+    /// Outbound links declared dead after unanswered keepalives.
+    pub keepalive_failures: u64,
 }
 
 #[derive(Default)]
@@ -161,6 +197,8 @@ struct Counters {
     introductions: AtomicU64,
     rendezvous_joins: AtomicU64,
     stream_cells: AtomicU64,
+    links_refused: AtomicU64,
+    keepalive_failures: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -179,9 +217,15 @@ struct Inner {
     observer: Option<Observer>,
     table: Mutex<Table>,
     hs: Mutex<HsTable>,
-    out_links: tokio::sync::Mutex<HashMap<SocketAddr, Link>>,
+    /// Outbound links by the next relay's identity.
+    out_links: tokio::sync::Mutex<HashMap<NodeId, Link>>,
     counters: Counters,
     shutdown: CancellationToken,
+    scope: NetworkScope,
+    trusted: TrustedRelays,
+    links: Arc<Semaphore>,
+    links_per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
+    tasks: TaskTracker,
 }
 
 #[derive(Default)]
@@ -256,16 +300,37 @@ impl Relay {
                 "a relay's role must be entry, middle, exit, or rendezvous".into(),
             ));
         }
-        if !config.listen.ip().is_loopback() {
-            return Err(NetError::NotLoopback(config.listen));
+        config.scope.check(config.listen)?;
+        if !crate::descriptor::valid_label(&config.nickname, crate::descriptor::MAX_NICKNAME_LEN)
+            || config.nickname.is_empty()
+        {
+            return Err(NetError::InvalidConfig(format!(
+                "nickname \"{}\" must be 1-32 characters of a-z, 0-9, - and _",
+                config.nickname
+            )));
+        }
+        if !crate::descriptor::valid_label(&config.family, crate::descriptor::MAX_FAMILY_LEN) {
+            return Err(NetError::InvalidConfig(format!(
+                "family \"{}\" must be up to 32 characters of a-z, 0-9, - and _",
+                config.family
+            )));
+        }
+        if config.trusted.scope() != config.scope {
+            return Err(NetError::InvalidConfig(
+                "the trusted relay set uses a different network scope".into(),
+            ));
         }
         let listener = TcpListener::bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
         let advertised = config.advertise.unwrap_or(local_addr);
-        if !advertised.ip().is_loopback() {
-            return Err(NetError::NotLoopback(advertised));
-        }
-        let descriptor = RelayDescriptor::sign(&keys, &config.nickname, config.role, advertised);
+        config.scope.check_reachable(advertised)?;
+        let descriptor = RelayDescriptor::sign_with_family(
+            &keys,
+            &config.nickname,
+            config.role,
+            advertised,
+            &config.family,
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 keys,
@@ -275,8 +340,13 @@ impl Relay {
                 descriptor,
                 timeouts: config.timeouts,
                 limits: config.limits,
-                policy: config.policy,
+                policy: config.policy.with_scope(config.scope),
                 observer: config.observer,
+                scope: config.scope,
+                trusted: config.trusted,
+                links: Arc::new(Semaphore::new(config.limits.max_links)),
+                links_per_ip: Mutex::new(HashMap::new()),
+                tasks: TaskTracker::new(),
                 table: Mutex::new(Table::default()),
                 hs: Mutex::new(HsTable::default()),
                 out_links: tokio::sync::Mutex::new(HashMap::new()),
@@ -333,12 +403,28 @@ impl Relay {
                         continue;
                     }
                 };
+                let Some(slot) = self.inner.admit(peer) else {
+                    continue; // dropped: outside the scope or over a limit
+                };
                 let inner = Arc::clone(&self.inner);
-                tokio::spawn(
-                    inner
-                        .handle_inbound(stream, peer)
-                        .instrument(tracing::Span::current()),
+                self.inner.tasks.spawn(
+                    async move {
+                        inner.handle_inbound(stream, peer).await;
+                        drop(slot);
+                    }
+                    .instrument(tracing::Span::current()),
                 );
+            }
+            // Graceful shutdown: inbound tasks destroy their circuits
+            // (telling both neighbours) and flush their links.
+            info!("relay stopping: closing links and destroying circuits");
+            drop(self.listener);
+            self.inner.tasks.close();
+            if tokio::time::timeout(Duration::from_secs(5), self.inner.tasks.wait())
+                .await
+                .is_err()
+            {
+                warn!("some links did not close within 5 s");
             }
             info!("relay stopped");
             Ok(())
@@ -375,10 +461,14 @@ impl RelayHandle {
             introductions: c.introductions.load(Ordering::Relaxed),
             rendezvous_joins: c.rendezvous_joins.load(Ordering::Relaxed),
             stream_cells: c.stream_cells.load(Ordering::Relaxed),
+            open_links: self.inner.limits.max_links - self.inner.links.available_permits(),
+            links_refused: c.links_refused.load(Ordering::Relaxed),
+            keepalive_failures: c.keepalive_failures.load(Ordering::Relaxed),
         }
     }
 
-    /// Stop accepting, close every link, and destroy every circuit.
+    /// Stop accepting, destroy every circuit (telling both neighbours), and
+    /// close every link. [`Relay::serve`] returns once this is done.
     pub fn shutdown(&self) {
         self.inner.shutdown.cancel();
     }
@@ -401,18 +491,104 @@ impl Inner {
 
     // ------------------------------------------------------------ inbound
 
+    /// Decide whether to take a new connection: the peer must be inside the
+    /// scope, and the total and per-IP link limits must not be exceeded.
+    fn admit(self: &Arc<Self>, peer: SocketAddr) -> Option<LinkSlot> {
+        let refuse = |why: &str| {
+            bump(&self.counters.links_refused);
+            warn!(%peer, "refused connection: {why}");
+            None
+        };
+        if !self.scope.allows(peer) {
+            return refuse("peer is outside the network scope");
+        }
+        let Ok(permit) = Arc::clone(&self.links).try_acquire_owned() else {
+            return refuse("too many links");
+        };
+        let mut per_ip = self.links_per_ip.lock().unwrap();
+        let count = per_ip.entry(peer.ip()).or_insert(0);
+        if *count >= self.limits.max_links_per_ip {
+            drop(per_ip);
+            return refuse("too many links from this address");
+        }
+        *count += 1;
+        Some(LinkSlot {
+            inner: Arc::clone(self),
+            ip: peer.ip(),
+            _permit: permit,
+        })
+    }
+
     async fn handle_inbound(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
-        info!(%peer, "inbound link opened");
+        debug!(%peer, "inbound connection");
         match self.serve_inbound(stream).await {
             Ok(()) => info!(%peer, "inbound link closed"),
+            Err(e @ (NetError::Untrusted(_) | NetError::Crypto(_))) => {
+                bump(&self.counters.links_refused);
+                warn!(%peer, error = %e, "refused link");
+            }
             Err(e) => warn!(%peer, error = %e, "inbound link closed with error"),
         }
     }
 
+    /// Who may open which kind of link to this relay.
+    fn authorize(
+        &self,
+        kind: LinkKind,
+        initiator: Option<&[u8; 32]>,
+    ) -> Result<Option<Role>, String> {
+        match kind {
+            LinkKind::Probe => Ok(None),
+            LinkKind::Client if self.role == Role::Entry => Ok(None),
+            LinkKind::Client => Err(format!(
+                "a {} relay does not accept client links",
+                self.role
+            )),
+            LinkKind::Relay => {
+                let key = initiator.ok_or("relay link without a key")?;
+                let relay = self
+                    .trusted
+                    .find_by_link_key(key)
+                    .ok_or("link key does not belong to any trusted relay")?;
+                if Some(relay.role) != self.role.expected_upstream() {
+                    return Err(format!(
+                        "{} is a {} relay, which may not open links to a {} relay",
+                        relay.nickname, relay.role, self.role
+                    ));
+                }
+                Ok(Some(relay.role))
+            }
+            LinkKind::Directory => Err("this is a relay, not a directory authority".into()),
+        }
+    }
+
     async fn serve_inbound(self: &Arc<Self>, stream: TcpStream) -> Result<(), NetError> {
-        let mut conn = Connection::new(stream)?;
-        let peer_role = handshake_inbound(&mut conn, self.role, self.timeouts.handshake).await?;
-        info!(%peer_role, "link handshake complete");
+        let mut authenticated = None;
+        let accepted = Connection::accept(
+            stream,
+            self.keys.link_secret(),
+            self.timeouts.handshake,
+            |kind, initiator| {
+                authenticated = self.authorize(kind, initiator)?;
+                Ok(())
+            },
+        )
+        .await?;
+        let mut conn = accepted.conn;
+        if accepted.kind == LinkKind::Probe {
+            // Health check: the Noise handshake proved we hold the link key;
+            // say who we are and close.
+            conn.send(&LinkMsg::Welcome {
+                version: crate::protocol::MORP_VERSION,
+                role: self.role,
+            })
+            .await?;
+            debug!("answered health probe");
+            return Ok(());
+        }
+        let peer_role =
+            handshake_inbound(&mut conn, self.role, authenticated, self.timeouts.handshake).await?;
+        info!(%peer_role, "link handshake complete (Noise authenticated)");
         let (link, mut reader) = conn.into_link();
 
         let result = loop {
@@ -449,6 +625,10 @@ impl Inner {
                         self.teardown(&circuit, reason, false, true).await;
                     }
                 }
+                LinkMsg::Ping { nonce } => {
+                    let _ = link.send(LinkMsg::Pong { nonce }).await;
+                }
+                LinkMsg::Pong { .. } => {}
                 other => {
                     let detail = format!("unexpected {other:?} on inbound link");
                     let _ = link
@@ -471,10 +651,16 @@ impl Inner {
                 .map(|(_, c)| Arc::clone(c))
                 .collect()
         };
+        // On shutdown the link is still up: tell the creator too.
+        let (reason, notify_inbound) = if self.shutdown.is_cancelled() {
+            (DestroyReason::RelayShutdown, true)
+        } else {
+            (DestroyReason::LinkClosed, false)
+        };
         for circuit in orphans {
-            self.teardown(&circuit, DestroyReason::LinkClosed, false, true)
-                .await;
+            self.teardown(&circuit, reason, notify_inbound, true).await;
         }
+        reader.finish(link).await;
         result
     }
 
@@ -614,29 +800,22 @@ impl Inner {
                         ErrorCode::NotAllowed,
                         "circuit is already extended".to_owned(),
                     ))
-                } else if !next_hop.ip().is_loopback() {
-                    Some((
-                        ErrorCode::ExtendRejected,
-                        format!("{next_hop} is not a loopback address"),
-                    ))
-                } else if next_hop == self.local_addr || next_hop == self.descriptor.addr {
-                    Some((
-                        ErrorCode::ExtendRejected,
-                        "cannot extend to itself".to_owned(),
-                    ))
                 } else {
-                    None
+                    self.check_extend_target(next_hop, &request.node_id).err()
                 };
                 if let Some((code, detail)) = refusal {
-                    warn!(circ, ?code, "refused EXTEND");
+                    warn!(circ, ?code, %detail, "refused EXTEND");
                     self.reply_error(circuit, code, &detail).await;
                     return;
                 }
+                let Some(next) = self.trusted.find(&request.node_id) else {
+                    return;
+                };
                 *circuit.next.lock().unwrap() = Next::Connecting;
                 let this = Arc::clone(self);
                 let circuit = Arc::clone(circuit);
                 tokio::spawn(
-                    async move { this.extend(circuit, next_hop, request).await }
+                    async move { this.extend(circuit, next, request).await }
                         .instrument(tracing::Span::current()),
                 );
             }
@@ -885,14 +1064,54 @@ impl Inner {
 
     // ------------------------------------------------------- extending
 
+    /// May this relay extend to the relay with identity `node_id` at
+    /// `next_hop`? Only trusted relays, at their published address, inside
+    /// the scope, with the next role in the circuit order.
+    fn check_extend_target(
+        &self,
+        next_hop: SocketAddr,
+        node_id: &NodeId,
+    ) -> Result<(), (ErrorCode, String)> {
+        let reject = |detail: String| Err((ErrorCode::ExtendRejected, detail));
+        if !self.scope.allows(next_hop) {
+            return reject(format!(
+                "{next_hop} is outside the network scope ({})",
+                self.scope
+            ));
+        }
+        if *node_id == self.keys.node_id()
+            || next_hop == self.local_addr
+            || next_hop == self.descriptor.addr
+        {
+            return reject("cannot extend to itself".to_owned());
+        }
+        let Some(next) = self.trusted.find(node_id) else {
+            return reject(format!("relay {} is not trusted", node_id.short()));
+        };
+        if next.addr != next_hop {
+            return reject(format!(
+                "{} is published at {}, not {next_hop}",
+                next.nickname, next.addr
+            ));
+        }
+        if !self.role.can_extend_to(next.role) {
+            return reject(format!(
+                "a {} relay does not extend to a {} relay",
+                self.role, next.role
+            ));
+        }
+        Ok(())
+    }
+
     async fn extend(
         self: Arc<Self>,
         circuit: Arc<Circuit>,
-        next_hop: SocketAddr,
+        next: RelayDescriptor,
         request: CreateRequest,
     ) {
         let circ = circuit.in_circ;
-        let link = match self.outbound_link(next_hop).await {
+        let next_hop = next.addr;
+        let link = match self.outbound_link(&next).await {
             Ok(link) => link,
             Err(e) => {
                 warn!(circ, %next_hop, error = %e, "cannot reach next hop");
@@ -993,44 +1212,72 @@ impl Inner {
 
     // ----------------------------------------------------------- outbound
 
-    async fn outbound_link(self: &Arc<Self>, addr: SocketAddr) -> Result<Link, NetError> {
-        let allowed: Vec<Role> = [Role::Middle, Role::Exit, Role::Rendezvous]
-            .into_iter()
-            .filter(|r| self.role.can_extend_to(*r))
-            .collect();
+    async fn outbound_link(self: &Arc<Self>, next: &RelayDescriptor) -> Result<Link, NetError> {
         let mut links = self.out_links.lock().await;
-        if let Some(link) = links.get(&addr)
+        if let Some(link) = links.get(&next.node_id)
             && !link.is_closed()
         {
             return Ok(link.clone());
         }
         let origin = format!("relay:{}", self.nickname);
-        let mut conn =
-            Connection::connect_checked(addr, self.timeouts.connect, &self.policy, &origin).await?;
-        handshake_outbound(&mut conn, self.role, &allowed, self.timeouts.handshake).await?;
+        let mut conn = Connection::connect_checked(
+            next.addr,
+            LinkKind::Relay,
+            &next.link_key,
+            Some(self.keys.link_secret()),
+            &self.timeouts,
+            &self.policy,
+            &origin,
+        )
+        .await?;
+        handshake_outbound(&mut conn, self.role, &[next.role], self.timeouts.handshake).await?;
         let (link, reader) = conn.into_link();
-        links.insert(addr, link.clone());
-        info!(next_hop = %addr, "outbound link opened");
-        tokio::spawn(
+        links.insert(next.node_id, link.clone());
+        info!(next_hop = %next.addr, relay = %next.nickname, "outbound link opened (Noise IK)");
+        let key = next.node_id;
+        self.tasks.spawn(
             Arc::clone(self)
-                .serve_outbound(link.clone(), reader)
+                .serve_outbound(link.clone(), reader, key)
                 .instrument(tracing::Span::current()),
         );
         Ok(link)
     }
 
-    async fn serve_outbound(self: Arc<Self>, link: Link, mut reader: LinkReader) {
+    async fn serve_outbound(self: Arc<Self>, link: Link, mut reader: LinkReader, key: NodeId) {
+        let mut unanswered: u32 = 0;
         let result: Result<(), NetError> = loop {
             let received = tokio::select! {
-                received = reader.recv(None) => received,
+                received = reader.recv(Some(self.timeouts.keepalive)) => received,
                 _ = self.shutdown.cancelled() => break Ok(()),
             };
             let msg = match received {
-                Ok(Some(msg)) => msg,
+                Ok(Some(msg)) => {
+                    unanswered = 0;
+                    msg
+                }
                 Ok(None) => break Ok(()),
+                Err(NetError::Timeout) => {
+                    // Quiet link: is the next relay still there?
+                    if unanswered >= 2 {
+                        bump(&self.counters.keepalive_failures);
+                        break Err(NetError::Protocol(
+                            "next relay stopped answering keepalives".into(),
+                        ));
+                    }
+                    unanswered += 1;
+                    let nonce = u64::from_le_bytes(crate::crypto::random_bytes::<8>());
+                    if link.send(LinkMsg::Ping { nonce }).await.is_err() {
+                        break Err(NetError::ConnectionClosed);
+                    }
+                    continue;
+                }
                 Err(e) => break Err(e),
             };
             match msg {
+                LinkMsg::Ping { nonce } => {
+                    let _ = link.send(LinkMsg::Pong { nonce }).await;
+                }
+                LinkMsg::Pong { .. } => {}
                 LinkMsg::Created { circ, reply } => {
                     let Some(circuit) = self.lookup_out(link.id(), circ) else {
                         continue;
@@ -1100,11 +1347,8 @@ impl Inner {
 
         {
             let mut links = self.out_links.lock().await;
-            if links
-                .get(&link.peer_addr())
-                .is_some_and(|l| l.id() == link.id())
-            {
-                links.remove(&link.peer_addr());
+            if links.get(&key).is_some_and(|l| l.id() == link.id()) {
+                links.remove(&key);
             }
         }
         let orphans: Vec<_> = {
@@ -1116,10 +1360,15 @@ impl Inner {
                 .map(|(_, c)| Arc::clone(c))
                 .collect()
         };
+        let reason = if self.shutdown.is_cancelled() {
+            DestroyReason::RelayShutdown
+        } else {
+            DestroyReason::NextHopFailed
+        };
         for circuit in orphans {
-            self.teardown(&circuit, DestroyReason::NextHopFailed, true, false)
-                .await;
+            self.teardown(&circuit, reason, true, true).await;
         }
+        reader.finish(link).await;
     }
 
     // ------------------------------------------------------------ helpers
@@ -1244,6 +1493,25 @@ impl Inner {
         }
         if let Some(partner) = partner {
             Box::pin(self.teardown(&partner, DestroyReason::NextHopFailed, true, false)).await;
+        }
+    }
+}
+
+/// One admitted inbound connection; frees its limits when dropped.
+struct LinkSlot {
+    inner: Arc<Inner>,
+    ip: std::net::IpAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for LinkSlot {
+    fn drop(&mut self) {
+        let mut per_ip = self.inner.links_per_ip.lock().unwrap();
+        if let Entry::Occupied(mut count) = per_ip.entry(self.ip) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
         }
     }
 }

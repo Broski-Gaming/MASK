@@ -4,13 +4,14 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mask_net::address::MorpAddress;
-use mask_net::directory::DEFAULT_DIRECTORY;
+use mask_net::authority::client::{AuthorityClient, spawn_refresher};
+use mask_net::config::NetworkConfig;
 use mask_net::directory::client::DirectoryClient;
+use mask_net::directory::{DEFAULT_DIRECTORY, ServiceDirectory};
 use mask_net::hs::app::serve_site;
 use mask_net::hs::client::{ClientConfig, MorpClient};
 use mask_net::hs::service::{HiddenService, HostConfig};
@@ -19,6 +20,7 @@ use mask_net::service::descriptor::{DEFAULT_LIFETIME, MAX_INTRO_POINTS, MAX_LIFE
 use mask_net::service::keys::ServiceKeys;
 use mask_net::service::site::Site;
 use mask_net::service::{now_millis, now_secs};
+use mask_net::trust::TrustedRelays;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::signal::unix::{SignalKind, signal};
@@ -39,9 +41,15 @@ struct Args {
     #[arg(long, global = true, default_value = DEFAULT_DIRECTORY)]
     directory: SocketAddr,
 
-    /// Folder of relay descriptors published by mask-relay.
+    /// Folder of relay descriptors published by mask-relay (local mode).
     #[arg(long, global = true, default_value = "runtime/directory")]
     relay_directory: PathBuf,
+
+    /// Network mode (v0.6 testnet): use the directory authorities and the
+    /// signed relay consensus described by this network.toml instead of
+    /// --directory and --relay-directory.
+    #[arg(long, global = true)]
+    network: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -113,6 +121,35 @@ async fn main() -> ExitCode {
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The service directory and relay source for this run.
+async fn open_network(args: &Args) -> Result<(ServiceDirectory, TrustedRelays), String> {
+    match &args.network {
+        None => {
+            let directory = DirectoryClient::new(args.directory, Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+            Ok((
+                directory.into(),
+                TrustedRelays::from(args.relay_directory.clone()),
+            ))
+        }
+        Some(path) => {
+            let network = NetworkConfig::load(path).map_err(|e| e.to_string())?;
+            let relays = TrustedRelays::consensus(network.scope);
+            let authorities = AuthorityClient::new(network);
+            let count = authorities
+                .refresh(&relays)
+                .await
+                .map_err(|e| format!("{e}\nIs a directory authority running and reachable?"))?
+                .unwrap_or(0);
+            eprintln!(
+                "Network \"{}\": verified consensus with {count} relay(s).",
+                authorities.network().name
+            );
+            Ok((authorities.into(), relays))
         }
     }
 }
@@ -198,8 +235,7 @@ async fn host(
     let address = parse(address)?;
     let identity =
         ServiceKeys::load_address(&args.services_dir, &address).map_err(|e| e.to_string())?;
-    let client =
-        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let (client, relays) = open_network(args).await?;
 
     // The local web application: built-in static site or the user's own app.
     let (app_addr, app_desc) = match (site, app) {
@@ -221,7 +257,16 @@ async fn host(
         (None, None) => return Err("give --site or --app".into()),
     };
 
-    let mut config = HostConfig::new(args.relay_directory.clone(), app_addr);
+    let stop_refresh = tokio_util::sync::CancellationToken::new();
+    if let Some(authorities) = client.authorities() {
+        spawn_refresher(
+            authorities.clone(),
+            relays.clone(),
+            Duration::from_secs(30),
+            stop_refresh.clone(),
+        );
+    }
+    let mut config = HostConfig::new(relays, app_addr);
     config.intro_points = intro_points;
     println!("Building introduction circuits through MORP relays…");
     let service = HiddenService::start(identity, config).await.map_err(|e| {
@@ -230,13 +275,15 @@ async fn host(
              rendezvous relay (see README)."
         )
     })?;
-    let stats = service.stats();
+    let wanted = service.wanted_intro_points();
 
     let mut revision = now_millis();
     client
         .publish(&service.descriptor(now_secs(), lifetime, revision))
         .await
-        .map_err(|e| format!("{e}\nIs the directory running? Start it with: mask-directory"))?;
+        .map_err(|e| {
+            format!("{e}\nIs the directory running? Start mask-directory (local) or mask-authority (network).")
+        })?;
 
     let pid_path = args.services_dir.join(address.id()).join(PID_FILE);
     fs::write(&pid_path, std::process::id().to_string()).map_err(|e| e.to_string())?;
@@ -253,24 +300,42 @@ async fn host(
     let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut refresh = tokio::time::interval(Duration::from_secs((lifetime / 3).max(1)));
     refresh.tick().await; // fires immediately; we just published
-    let mut health = tokio::time::interval(Duration::from_secs(2));
-    let outcome = loop {
-        tokio::select! {
-            _ = refresh.tick() => {
-                revision = now_millis().max(revision + 1);
-                if let Err(e) = client.publish(&service.descriptor(now_secs(), lifetime, revision)).await {
-                    tracing::warn!("descriptor refresh failed: {e}");
-                }
+    // Lost introduction points are replaced (at other rendezvous-role
+    // relays when possible) and the descriptor is republished.
+    let mut health = tokio::time::interval(Duration::from_secs(5));
+    let outcome: Result<(), String> = loop {
+        let republish = tokio::select! {
+            _ = refresh.tick() => true,
+            _ = service.intro_point_lost() => {
+                tracing::warn!(
+                    live = service.live_intro_points(),
+                    "an introduction point was lost; re-establishing"
+                );
+                replace_intro_points(&service).await
             }
             _ = health.tick() => {
-                if stats.live_intro_points.load(Ordering::SeqCst) == 0 {
-                    break Err("all introduction circuits were lost (a relay stopped?); restart the host".to_owned());
+                if service.live_intro_points() < wanted {
+                    replace_intro_points(&service).await
+                } else {
+                    false
                 }
             }
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = sigterm.recv() => break Ok(()),
+        };
+        if republish {
+            revision = now_millis().max(revision + 1);
+            let descriptor = service.descriptor(now_secs(), lifetime, revision);
+            match client.publish(&descriptor).await {
+                Ok(()) => tracing::info!(
+                    intro_points = descriptor.intro_points.len(),
+                    "descriptor published"
+                ),
+                Err(e) => tracing::warn!("descriptor publish failed: {e}"),
+            }
         }
     };
+    stop_refresh.cancel();
 
     println!("\nStopping: withdrawing the descriptor and closing circuits.");
     service.shutdown();
@@ -304,11 +369,34 @@ fn stop(services_dir: &Path, address: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Try to bring the service back to its configured intro points. Returns
+/// whether the descriptor should be republished.
+async fn replace_intro_points(service: &HiddenService) -> bool {
+    match service.replenish().await {
+        Ok(0) => false,
+        Ok(added) => {
+            tracing::info!(
+                added,
+                live = service.live_intro_points(),
+                "introduction points re-established"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                live = service.live_intro_points(),
+                "could not re-establish introduction points yet ({e}); will retry"
+            );
+            // Publish the shrunken list so clients stop trying dead intro points.
+            service.live_intro_points() > 0
+        }
+    }
+}
+
 async fn verify(args: &Args, address: &str) -> Result<(), String> {
     let address = parse(address)?;
     println!("1. Address format and checksum: OK");
-    let directory =
-        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let (directory, relays) = open_network(args).await?;
     let descriptor = directory
         .lookup(&address)
         .await
@@ -319,7 +407,7 @@ async fn verify(args: &Args, address: &str) -> Result<(), String> {
         descriptor.intro_points.len(),
         descriptor.expires.saturating_sub(now_secs())
     );
-    let client = MorpClient::new(directory, ClientConfig::new(args.relay_directory.clone()));
+    let client = MorpClient::new(directory, ClientConfig::new(relays));
     let (_session, route) = client.connect(&address).await.map_err(|e| e.to_string())?;
     println!(
         "3. Reached through relays (intro point: {}; your circuit: {} → {} → {}): OK",
@@ -332,9 +420,8 @@ async fn verify(args: &Args, address: &str) -> Result<(), String> {
 
 async fn fetch_page(args: &Args, address: &str, path: &str) -> Result<(), String> {
     let address = parse(address)?;
-    let directory =
-        DirectoryClient::new(args.directory, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let client = MorpClient::new(directory, ClientConfig::new(args.relay_directory.clone()));
+    let (directory, relays) = open_network(args).await?;
+    let client = MorpClient::new(directory, ClientConfig::new(relays));
     let path = if path.starts_with('/') {
         path.to_owned()
     } else {

@@ -5,6 +5,11 @@
 //! - **Onion key** (X25519): generated fresh every time the relay starts and
 //!   never written to disk. It is bound to the identity by the signed relay
 //!   descriptor. Restarting a relay therefore invalidates old descriptors.
+//! - **Link key** (X25519): also fresh per run and never written to disk.
+//!   It authenticates the relay's Noise link handshakes (see
+//!   [`crate::transport`]) and is bound to the identity by the descriptor
+//!   signature, so a peer that completes a Noise handshake with this key is
+//!   the relay with this identity.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
@@ -23,6 +28,7 @@ const IDENTITY_FILE: &str = "identity.key";
 pub struct RelayKeys {
     identity: SigningKey,
     onion: StaticSecret,
+    link: StaticSecret,
 }
 
 impl RelayKeys {
@@ -32,6 +38,7 @@ impl RelayKeys {
         Self {
             identity: SigningKey::from_bytes(&seed),
             onion: StaticSecret::from(random_bytes::<32>()),
+            link: StaticSecret::from(random_bytes::<32>()),
         }
     }
 
@@ -51,6 +58,7 @@ impl RelayKeys {
         Ok(Self {
             identity: SigningKey::from_bytes(&seed),
             onion: StaticSecret::from(random_bytes::<32>()),
+            link: StaticSecret::from(random_bytes::<32>()),
         })
     }
 
@@ -60,6 +68,14 @@ impl RelayKeys {
 
     pub fn onion_public(&self) -> [u8; 32] {
         PublicKey::from(&self.onion).to_bytes()
+    }
+
+    pub fn link_public(&self) -> [u8; 32] {
+        PublicKey::from(&self.link).to_bytes()
+    }
+
+    pub(crate) fn link_secret(&self) -> &StaticSecret {
+        &self.link
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
@@ -153,6 +169,8 @@ mod tests {
         let second = RelayKeys::load_or_create(dir.path()).unwrap();
         assert_eq!(first.node_id(), second.node_id());
         assert_ne!(first.onion_public(), second.onion_public());
+        assert_ne!(first.link_public(), second.link_public());
+        assert_ne!(first.link_public(), first.onion_public());
     }
 
     #[test]

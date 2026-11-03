@@ -1,0 +1,10 @@
+# Directory authority (machine A). Run: mask-authority run --config authority.toml
+name = "auth1"                      # must match an [[authority]] in network.toml
+listen = "192.168.1.10:7300"        # this machine's private address (never 0.0.0.0)
+network = "network.toml"            # relative paths are relative to this file
+approved_relays = "approved-relays.toml"
+data_dir = "/var/lib/mask/authority" # authority.key + link.key (0600)
+
+consensus_interval_secs = 60        # re-sign this often (and on every change)
+consensus_lifetime_secs = 600       # clients keep using a consensus this long
+probe_interval_secs = 20            # health-check every relay this often

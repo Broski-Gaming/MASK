@@ -4,18 +4,26 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use mask_net::authority::client::AuthorityClient;
 use mask_net::client::ClientLink;
+use mask_net::config::NetworkConfig;
 use mask_net::descriptor::Directory;
-use mask_net::transport::Timeouts;
+use mask_net::transport::{ConnectPolicy, Timeouts};
+use mask_net::trust::TrustedRelays;
 
 /// Send test messages over MORP circuits (entry → middle → exit) and print
 /// the replies. EXPERIMENTAL and unreviewed: not anonymous.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Folder containing relay descriptors.
+    /// Folder containing relay descriptors (local mode).
     #[arg(long, default_value = "runtime/directory")]
     directory: PathBuf,
+
+    /// Network mode: take relays from the signed consensus of the
+    /// authorities in this network.toml.
+    #[arg(long)]
+    network: Option<PathBuf>,
 
     /// Message to send. Repeat to send several.
     #[arg(long, short, default_value = "hello from MASK")]
@@ -31,16 +39,42 @@ async fn main() -> ExitCode {
     restore_default_sigpipe();
     let args = Args::parse();
 
-    let (directory, problems) = match Directory::load(&args.directory) {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            eprintln!("{e}\nStart the three relays first (see README).");
-            return ExitCode::FAILURE;
+    let (directory, policy): (Directory, ConnectPolicy) = match &args.network {
+        None => match Directory::load(&args.directory) {
+            Ok((directory, problems)) => {
+                for problem in problems {
+                    eprintln!("skipped descriptor: {problem}");
+                }
+                (directory, ConnectPolicy::allow_all())
+            }
+            Err(e) => {
+                eprintln!("{e}\nStart the three relays first (see README).");
+                return ExitCode::FAILURE;
+            }
+        },
+        Some(path) => {
+            let consensus = NetworkConfig::load(path).map(AuthorityClient::new);
+            let fetched = match consensus {
+                Ok(client) => {
+                    let trusted = TrustedRelays::consensus(client.network().scope);
+                    let scope = client.network().scope;
+                    client
+                        .refresh(&trusted)
+                        .await
+                        .and_then(|_| trusted.snapshot())
+                        .map(|d| (d, ConnectPolicy::allow_all().with_scope(scope)))
+                }
+                Err(e) => Err(e),
+            };
+            match fetched {
+                Ok(found) => found,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
-    for problem in problems {
-        eprintln!("skipped descriptor: {problem}");
-    }
     let path = match directory.choose_path() {
         Ok(path) => path,
         Err(e) => {
@@ -60,13 +94,14 @@ async fn main() -> ExitCode {
         );
     }
 
-    let link = match ClientLink::connect(&path.entry, Timeouts::default()).await {
-        Ok(link) => link,
-        Err(e) => {
-            eprintln!("cannot connect to entry relay: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let link =
+        match ClientLink::connect_with(&path.entry, Timeouts::default(), &policy, "client").await {
+            Ok(link) => link,
+            Err(e) => {
+                eprintln!("cannot connect to entry relay: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let mut failed = false;
     for n in 1..=args.circuits.max(1) {

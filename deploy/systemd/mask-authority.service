@@ -1,0 +1,33 @@
+# MORP directory authority: /etc/mask/authority.toml
+#   sudo systemctl enable --now mask-authority
+# authority.toml must use data_dir = "/var/lib/mask/authority".
+[Unit]
+Description=MASK MORP directory authority (experimental, private testnet)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mask-authority run --config /etc/mask/authority.toml
+DynamicUser=yes
+StateDirectory=mask/authority
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

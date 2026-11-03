@@ -1,7 +1,12 @@
 //! MORP end-to-end tests: real relays on 127.0.0.1 with OS-assigned ports.
+//!
+//! All relays in this file share one fixed trusted relay set, standing in
+//! for a consensus: a relay accepts links from, and extends to, only relays
+//! in it.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use mask_net::NetError;
@@ -12,11 +17,13 @@ use mask_net::crypto::onion::{CellCipher, Direction};
 use mask_net::descriptor::{CircuitPath, RelayDescriptor};
 use mask_net::identity::Role;
 use mask_net::protocol::{
-    DestroyReason, ErrorCode, LayerBody, LinkErrorCode, LinkMsg, MAX_DATA_LEN, MAX_FRAME_LEN,
-    MORP_VERSION, RelayCmd, decode, encode,
+    DestroyReason, ErrorCode, LayerBody, LinkErrorCode, LinkMsg, MAX_DATA_LEN, MORP_VERSION,
+    RelayCmd, decode, encode,
 };
 use mask_net::relay::{Relay, RelayConfig};
-use mask_net::transport::{Connection, Timeouts, handshake_outbound};
+use mask_net::scope::NetworkScope;
+use mask_net::transport::{Connection, LinkKind, Timeouts, handshake_outbound};
+use mask_net::trust::TrustedRelays;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -26,16 +33,30 @@ fn fast() -> Timeouts {
         handshake: Duration::from_millis(800),
         response: Duration::from_secs(3),
         idle: Duration::from_secs(10),
+        keepalive: Duration::from_secs(5),
     }
 }
+
+/// The relays every relay in this file trusts.
+static TRUSTED: LazyLock<TrustedRelays> =
+    LazyLock::new(|| TrustedRelays::fixed(NetworkScope::Loopback));
 
 async fn start_relay_with(role: Role, keys: RelayKeys) -> RelayDescriptor {
     let mut config = RelayConfig::new(role.to_string(), role, "127.0.0.1:0".parse().unwrap());
     config.timeouts = fast();
+    config.trusted = TRUSTED.clone();
     let relay = Relay::bind(config, keys).await.expect("relay binds");
     let descriptor = relay.descriptor();
+    TRUSTED.insert(descriptor.clone());
     tokio::spawn(relay.serve());
     descriptor
+}
+
+/// Open a Noise client link to a relay without the MORP handshake.
+async fn raw_client_link(relay: &RelayDescriptor) -> Connection {
+    Connection::connect(relay.addr, LinkKind::Client, &relay.link_key, None, &fast())
+        .await
+        .unwrap()
 }
 
 async fn start_relay(role: Role) -> RelayDescriptor {
@@ -60,9 +81,11 @@ async fn dead_addr() -> SocketAddr {
         .unwrap()
 }
 
-/// A validly signed descriptor for `role` that points at `addr`.
+/// A validly signed, trusted descriptor for `role` that points at `addr`.
 fn descriptor_at(role: Role, addr: SocketAddr) -> RelayDescriptor {
-    RelayDescriptor::sign(&RelayKeys::generate(), "fake", role, addr)
+    let d = RelayDescriptor::sign(&RelayKeys::generate(), "fake", role, addr);
+    TRUSTED.insert(d.clone());
+    d
 }
 
 fn with_exit(path: &CircuitPath, exit: RelayDescriptor) -> CircuitPath {
@@ -339,16 +362,41 @@ async fn stale_onion_key_after_restart_is_refused() {
 }
 
 #[tokio::test]
-async fn impostor_at_entry_address_is_refused() {
+async fn impostor_at_entry_address_is_refused_at_the_link_layer() {
     let path = start_network().await;
-    // A descriptor with someone else's identity at the real entry's address.
+    // A descriptor with someone else's identity (and link key) at the real
+    // entry's address: the relay there cannot prove it holds that link key,
+    // so the Noise handshake fails before any circuit is attempted.
     let impostor = RelayDescriptor::sign(
         &RelayKeys::generate(),
         "entry",
         Role::Entry,
         path.entry.addr,
     );
-    let link = ClientLink::connect(&impostor, fast()).await.unwrap();
+    let err = ClientLink::connect(&impostor, fast()).await.err().unwrap();
+    // The real entry cannot decrypt a handshake for the impostor's key, so
+    // it closes the connection without answering.
+    assert!(
+        matches!(
+            err,
+            NetError::Untrusted(_)
+                | NetError::LinkRejected {
+                    code: LinkErrorCode::Unauthenticated,
+                    ..
+                }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn right_link_key_but_wrong_identity_is_refused_by_ntor() {
+    // Defence in depth: even with the real entry's link key, a CREATE for
+    // another identity is refused by the circuit handshake.
+    let path = start_network().await;
+    let mut impostor = path.entry.clone();
+    impostor.node_id = RelayKeys::generate().node_id();
+    let link = ClientLink::connect(&path.entry, fast()).await.unwrap();
     let mut circuit = link.new_circuit();
     let err = circuit.create(&impostor).await.err().unwrap();
     assert!(
@@ -361,18 +409,74 @@ async fn impostor_at_entry_address_is_refused() {
 async fn client_cannot_link_directly_to_middle_or_exit() {
     let path = start_network().await;
     for relay in [&path.middle, &path.last] {
-        let err = ClientLink::connect(relay, fast()).await.err().unwrap();
+        let mut entry_like = relay.clone();
+        entry_like.role = Role::Entry; // get past the client's own check
+        let err = ClientLink::connect(&entry_like, fast())
+            .await
+            .err()
+            .unwrap();
         assert!(
             matches!(
                 err,
                 NetError::LinkRejected {
-                    code: LinkErrorCode::RoleNotAllowed,
+                    code: LinkErrorCode::Unauthenticated,
                     ..
                 }
             ),
             "{err:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn relay_refuses_to_extend_to_an_untrusted_relay() {
+    let path = start_network().await;
+    // A real, running middle that is not in the entry's trusted set.
+    let mut config = RelayConfig::new("stranger", Role::Middle, "127.0.0.1:0".parse().unwrap());
+    config.timeouts = fast();
+    let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
+    let stranger = relay.descriptor();
+    tokio::spawn(relay.serve());
+    let (_link, mut circuit) = one_hop(&path).await;
+    let err = circuit.extend(&stranger).await.err().unwrap();
+    assert_eq!(remote(err), (0, ErrorCode::ExtendRejected));
+}
+
+#[tokio::test]
+async fn relay_refuses_to_extend_to_an_address_other_than_the_published_one() {
+    let path = start_network().await;
+    let (_link, mut circuit) = one_hop(&path).await;
+    let mut moved = path.middle.clone();
+    moved.addr = dead_addr().await;
+    let err = circuit.extend(&moved).await.err().unwrap();
+    assert_eq!(remote(err), (0, ErrorCode::ExtendRejected));
+}
+
+#[tokio::test]
+async fn relay_link_from_an_untrusted_relay_is_refused() {
+    let path = start_network().await;
+    // An "entry" whose link key the middle has never seen.
+    let link_secret = x25519_dalek::StaticSecret::from(mask_net::crypto::random_bytes::<32>());
+    let err = Connection::connect(
+        path.middle.addr,
+        LinkKind::Relay,
+        &path.middle.link_key,
+        Some(&link_secret),
+        &fast(),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            err,
+            NetError::LinkRejected {
+                code: LinkErrorCode::Unauthenticated,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 // ======================================================= replay and tampering
@@ -496,20 +600,33 @@ async fn exit_refuses_to_extend() {
 }
 
 #[tokio::test]
-async fn extend_to_non_loopback_is_refused() {
+async fn extend_outside_the_scope_is_refused() {
     let path = start_network().await;
     let (_link, mut circuit) = one_hop(&path).await;
-    let outside = descriptor_at(Role::Middle, "192.0.2.1:7102".parse().unwrap());
-    let err = circuit.extend(&outside).await.err().unwrap();
-    assert_eq!(remote(err), (0, ErrorCode::ExtendRejected));
+    for addr in ["192.168.1.20:7102", "8.8.8.8:7102"] {
+        let outside = descriptor_at(Role::Middle, addr.parse().unwrap());
+        let err = circuit.extend(&outside).await.err().unwrap();
+        assert_eq!(remote(err), (0, ErrorCode::ExtendRejected), "{addr}");
+    }
 }
 
 #[tokio::test]
-async fn relay_refuses_non_loopback_listen_and_client_role() {
-    let outside = RelayConfig::new("x", Role::Entry, "0.0.0.0:0".parse().unwrap());
+async fn relay_refuses_out_of_scope_listen_and_client_role() {
+    for listen in ["0.0.0.0:0", "8.8.8.8:0", "192.168.1.20:0"] {
+        let outside = RelayConfig::new("x", Role::Entry, listen.parse().unwrap());
+        assert!(
+            matches!(
+                Relay::bind(outside, RelayKeys::generate()).await,
+                Err(NetError::OutOfScope { .. })
+            ),
+            "{listen}"
+        );
+    }
+    let mut public_advertise = RelayConfig::new("x", Role::Entry, "127.0.0.1:0".parse().unwrap());
+    public_advertise.advertise = Some("8.8.8.8:7101".parse().unwrap());
     assert!(matches!(
-        Relay::bind(outside, RelayKeys::generate()).await,
-        Err(NetError::NotLoopback(_))
+        Relay::bind(public_advertise, RelayKeys::generate()).await,
+        Err(NetError::OutOfScope { .. })
     ));
     let client = RelayConfig::new("x", Role::Client, "127.0.0.1:0".parse().unwrap());
     assert!(matches!(
@@ -523,6 +640,7 @@ async fn circuit_limit_per_link_is_enforced() {
     let mut config = RelayConfig::new("entry", Role::Entry, "127.0.0.1:0".parse().unwrap());
     config.timeouts = fast();
     config.limits.circuits_per_link = 2;
+    config.trusted = TRUSTED.clone();
     let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
     let entry = relay.descriptor();
     tokio::spawn(relay.serve());
@@ -546,9 +664,7 @@ async fn circuit_limit_per_link_is_enforced() {
 #[tokio::test]
 async fn wrong_protocol_version_is_rejected() {
     let path = start_network().await;
-    let mut conn = Connection::connect(path.entry.addr, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let mut conn = raw_client_link(&path.entry).await;
     conn.send(&LinkMsg::Hello {
         version: MORP_VERSION + 1,
         role: Role::Client,
@@ -565,11 +681,9 @@ async fn wrong_protocol_version_is_rejected() {
 }
 
 #[tokio::test]
-async fn garbage_frame_gets_link_error_and_disconnect() {
+async fn garbage_inside_the_encrypted_link_gets_link_error_and_disconnect() {
     let path = start_network().await;
-    let mut conn = Connection::connect(path.entry.addr, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let mut conn = raw_client_link(&path.entry).await;
     handshake_outbound(
         &mut conn,
         Role::Client,
@@ -578,47 +692,46 @@ async fn garbage_frame_gets_link_error_and_disconnect() {
     )
     .await
     .unwrap();
-    drop(conn);
-
-    let mut stream = TcpStream::connect(path.entry.addr).await.unwrap();
-    stream.write_all(&4u32.to_be_bytes()).await.unwrap();
-    stream.write_all(&[0xff; 4]).await.unwrap();
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf))
-        .await
-        .expect("relay should close the connection")
-        .unwrap();
-    let error: LinkMsg = decode(&buf[4..]).unwrap();
+    conn.send_bytes(&[0xff; 4]).await.unwrap();
     assert!(matches!(
-        error,
-        LinkMsg::LinkError {
+        conn.recv(Duration::from_secs(2)).await.unwrap(),
+        Some(LinkMsg::LinkError {
             code: LinkErrorCode::Malformed,
             ..
-        }
+        })
+    ));
+    assert!(matches!(
+        conn.recv(Duration::from_secs(2)).await,
+        Ok(None) | Err(_)
     ));
 }
 
 #[tokio::test]
-async fn oversized_frame_closes_the_link() {
+async fn plaintext_bytes_close_the_link_without_an_answer() {
+    // v0.5-style plaintext frames, garbage, and oversized lengths never get
+    // past the Noise handshake, and the relay sends nothing back.
     let path = start_network().await;
-    let mut stream = TcpStream::connect(path.entry.addr).await.unwrap();
-    stream
-        .write_all(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes())
-        .await
-        .unwrap();
-    let mut buf = [0u8; 64];
-    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-        .await
-        .expect("relay should close the connection");
-    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let hello = encode(&LinkMsg::Hello {
+        version: MORP_VERSION,
+        role: Role::Client,
+    });
+    let mut v2_frame = (hello.len() as u32).to_be_bytes().to_vec();
+    v2_frame.extend(&hello);
+    for bytes in [v2_frame, vec![0xff; 6], vec![0xff, 0xff, 0x00]] {
+        let mut stream = TcpStream::connect(path.entry.addr).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+            .await
+            .expect("relay should close the connection");
+        assert!(read.is_err() || buf.is_empty(), "relay answered {buf:?}");
+    }
 }
 
 #[tokio::test]
 async fn create_before_handshake_is_rejected() {
     let path = start_network().await;
-    let mut conn = Connection::connect(path.entry.addr, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let mut conn = raw_client_link(&path.entry).await;
     let (_, request) = ClientHandshake::start(path.entry.node_id, path.entry.onion_key);
     conn.send(&LinkMsg::Create { circ: 1, request })
         .await
@@ -636,9 +749,15 @@ async fn create_before_handshake_is_rejected() {
 
 async fn start_relay_idle(role: Role, idle: Duration) -> RelayDescriptor {
     let mut config = RelayConfig::new(role.to_string(), role, "127.0.0.1:0".parse().unwrap());
-    config.timeouts = Timeouts { idle, ..fast() };
+    config.timeouts = Timeouts {
+        idle,
+        keepalive: idle * 10,
+        ..fast()
+    };
+    config.trusted = TRUSTED.clone();
     let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
     let descriptor = relay.descriptor();
+    TRUSTED.insert(descriptor.clone());
     tokio::spawn(relay.serve());
     descriptor
 }

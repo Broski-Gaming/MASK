@@ -25,9 +25,7 @@ pub async fn serve_site(
     site: Site,
     listen: SocketAddr,
 ) -> Result<(SocketAddr, JoinHandle<()>), NetError> {
-    if !listen.ip().is_loopback() {
-        return Err(NetError::NotLoopback(listen));
-    }
+    crate::scope::NetworkScope::Loopback.check(listen)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     let app = Router::new()
@@ -71,9 +69,7 @@ impl AppForwarder {
         policy: ConnectPolicy,
         timeout: Duration,
     ) -> Result<Self, NetError> {
-        if !app.ip().is_loopback() {
-            return Err(NetError::NotLoopback(app));
-        }
+        crate::scope::NetworkScope::Loopback.check(app)?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(timeout)

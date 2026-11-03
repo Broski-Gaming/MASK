@@ -37,9 +37,7 @@ impl std::fmt::Display for LookupError {
 
 impl DirectoryClient {
     pub fn new(directory: SocketAddr, timeout: Duration) -> Result<Self, NetError> {
-        if !directory.ip().is_loopback() {
-            return Err(NetError::NotLoopback(directory));
-        }
+        crate::scope::NetworkScope::Loopback.check(directory)?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(timeout)

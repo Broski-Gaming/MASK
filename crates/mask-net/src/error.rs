@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use crate::crypto::CryptoError;
 use crate::protocol::{DestroyReason, ErrorCode, LinkErrorCode};
+use crate::scope::NetworkScope;
 
 #[derive(Debug)]
 pub enum NetError {
@@ -28,8 +29,15 @@ pub enum NetError {
         detail: String,
     },
     Descriptor(String),
-    /// MORP currently only runs on loopback addresses.
-    NotLoopback(SocketAddr),
+    /// The address is outside the configured network scope (public
+    /// addresses are always outside it).
+    OutOfScope {
+        addr: SocketAddr,
+        scope: NetworkScope,
+    },
+    /// A peer, relay, or document is not trusted (unknown key, identity
+    /// change, bad authority signature, ...).
+    Untrusted(String),
     InvalidConfig(String),
     /// The connection policy refused this connection.
     PolicyDenied {
@@ -57,10 +65,12 @@ impl fmt::Display for NetError {
                 write!(f, "hop {} reported {code:?}: {detail}", hop + 1)
             }
             Self::Descriptor(msg) => write!(f, "relay descriptor: {msg}"),
-            Self::NotLoopback(addr) => write!(
+            Self::OutOfScope { addr, scope } => write!(
                 f,
-                "{addr} is not a loopback address; MORP currently only runs on 127.0.0.1"
+                "{addr} is outside the allowed network scope ({}); MORP never uses public addresses",
+                scope.describe()
             ),
+            Self::Untrusted(why) => write!(f, "untrusted: {why}"),
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),
             Self::PolicyDenied { origin, addr } => {
                 write!(f, "connection from {origin} to {addr} denied by policy")

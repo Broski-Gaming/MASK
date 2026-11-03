@@ -1,6 +1,8 @@
 # MORP Hidden Services (v0.5, experimental)
 
-> **Status: experimental, unreviewed, localhost only.**
+> **Status: experimental, unreviewed.** One machine, or a private testnet
+> (v0.6, see `docs/DISTRIBUTED_NETWORK.md`), where descriptors are stored at
+> the directory authorities and all links are Noise-encrypted.
 > Every `.morp` connection now travels through MORP relay circuits, and
 > service descriptors no longer contain a network location. This is **not**
 > Tor-level anonymity: the network is a handful of relays on one computer,
@@ -205,8 +207,10 @@ periods); links with no circuits close after the idle timeout.
   them and blinds keys so directories cannot enumerate services).
 - **Denial of service.** Intro points can be flooded with introductions;
   there is no proof-of-work or rate limiting beyond simple caps.
-- **Intro point loss.** A host does not yet re-establish lost intro points;
-  it withdraws its descriptor and exits so it can be restarted.
+- **Intro point loss.** Since v0.6 a host that loses an intro circuit builds
+  a new intro point at another rendezvous-role relay and republishes its
+  descriptor; clients holding the old descriptor may fail once until they
+  fetch the new one.
 - **Browser-level risks.** WebKit fingerprinting and exploits; `.morp` pages
   are confined to their own origin by CSP, but JavaScript runs.
 - **Unreviewed design and code.** No independent review, formal analysis, or

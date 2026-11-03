@@ -1,0 +1,13 @@
+#!/usr/sbin/nft -f
+# Allow MORP ports only from the private LAN (adjust 192.168.1.0/24).
+# Load with: sudo nft -f nftables-morp.nft   (adds to an existing inet filter
+# table; merge into /etc/nftables.conf to make it permanent).
+table inet morp {
+    chain input {
+        type filter hook input priority 0; policy accept;
+        # 7101-7104 relays, 7300 authority
+        tcp dport { 7101-7104, 7300 } ip saddr 192.168.1.0/24 accept
+        tcp dport { 7101-7104, 7300 } ip saddr 127.0.0.0/8 accept
+        tcp dport { 7101-7104, 7300 } drop
+    }
+}

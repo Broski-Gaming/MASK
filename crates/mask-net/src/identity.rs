@@ -64,6 +64,7 @@ pub fn from_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
 /// an introduction point and as a rendezvous point. Exits only run the echo
 /// test service; `.morp` traffic never uses them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Client,
     Entry,

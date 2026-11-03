@@ -2,8 +2,9 @@
 //!
 //! WebKit hands every `morp://` request to [`handle`], which:
 //! 1. validates the `.morp` address (length, Base32, version, checksum, key);
-//! 2. resolves it through the local MORP directory (never public DNS) and
-//!    verifies the signed descriptor;
+//! 2. resolves it through the MORP directory (the local one, or the
+//!    testnet's directory authorities over Noise links; never public DNS)
+//!    and verifies the signed descriptor;
 //! 3. reaches the service **only through MORP relay circuits**: a circuit to
 //!    a rendezvous point, an introduction via one of the service's intro
 //!    points, and the service's own circuit joined at the rendezvous point;
@@ -22,10 +23,13 @@ use std::time::Duration;
 
 use http::{Response, StatusCode, header};
 use mask_net::address::parse_url;
+use mask_net::authority::client::AuthorityClient;
+use mask_net::config::NetworkConfig;
 use mask_net::directory::DEFAULT_DIRECTORY;
 use mask_net::directory::client::DirectoryClient;
 use mask_net::hs::client::{ClientConfig, FetchError, MorpClient};
 use mask_net::hs::session::HttpRequest;
+use mask_net::trust::TrustedRelays;
 
 /// Restricts `.morp` pages to their own service: no requests to the
 /// internet or to other origins, so a page cannot leak to clearnet.
@@ -35,9 +39,30 @@ const PAGE_CSP: &str = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: b
 const ERROR_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
 
 /// The browser's MORP client.
+///
+/// Network mode (v0.6 testnet):
+/// - `MASK_NETWORK=/path/to/network.toml`: relays come from the consensus
+///   signed by the authorities pinned there, and service descriptors are
+///   looked up at those authorities over Noise links.
+///
+/// Local mode (one machine, the default):
 /// - `MASK_DIRECTORY` (default 127.0.0.1:7200): service directory.
 /// - `MASK_RELAY_DIRECTORY` (default `runtime/directory`): relay descriptors.
 pub fn morp_client() -> Result<MorpClient, mask_net::NetError> {
+    if let Some(path) = std::env::var_os("MASK_NETWORK") {
+        let network = NetworkConfig::load(std::path::Path::new(&path))?;
+        tracing::info!(
+            network = %network.name,
+            scope = %network.scope,
+            authorities = network.authorities.len(),
+            "MORP network mode"
+        );
+        let relays = TrustedRelays::consensus(network.scope);
+        return Ok(MorpClient::new(
+            AuthorityClient::new(network),
+            ClientConfig::new(relays),
+        ));
+    }
     let directory = std::env::var("MASK_DIRECTORY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -99,12 +124,12 @@ pub async fn handle(client: &MorpClient, method: &str, uri: &str) -> Response<Ve
                 FetchError::DirectoryUnavailable(_) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "MORP directory unavailable",
-                    " Start it with: cargo run -p mask-net --bin mask-directory",
+                    " Start mask-directory (local mode) or check that a directory authority is reachable (MASK_NETWORK).",
                 ),
                 FetchError::RelaysUnavailable(_) | FetchError::CircuitFailed(_) => (
                     StatusCode::BAD_GATEWAY,
                     "MORP circuit failed",
-                    " Are the entry, middle, and rendezvous relays running?",
+                    " Are the entry, middle, and rendezvous relays running (and listed in the consensus)?",
                 ),
                 FetchError::ServiceUnavailable(_) => (
                     StatusCode::BAD_GATEWAY,
@@ -187,6 +212,7 @@ mod tests {
     use mask_net::service::site::Site;
     use mask_net::service::{now_millis, now_secs};
     use mask_net::transport::{ConnectPolicy, Timeouts};
+    use mask_net::trust::TrustedRelays;
 
     fn timeouts() -> Timeouts {
         Timeouts {
@@ -194,6 +220,7 @@ mod tests {
             handshake: Duration::from_secs(2),
             response: Duration::from_secs(5),
             idle: Duration::from_secs(30),
+            keepalive: Duration::from_secs(5),
         }
     }
 
@@ -231,6 +258,7 @@ mod tests {
             let mut config = RelayConfig::new(nick, role, "127.0.0.1:0".parse().unwrap());
             config.timeouts = timeouts();
             config.policy = policy.clone();
+            config.trusted = TrustedRelays::from(relay_dir.clone());
             let relay = Relay::bind(config, RelayKeys::generate()).await.unwrap();
             relay.descriptor().write_to_dir(&relay_dir).unwrap();
             if role == Role::Rendezvous {

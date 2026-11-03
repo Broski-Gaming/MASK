@@ -1,0 +1,37 @@
+# The authority admits ONLY these relays. Each nickname is bound to one
+# identity key and one role: a relay that comes back with a different key is
+# refused ("identity change refused") until you edit this file.
+#
+# Get each block on the relay's machine with:
+#   mask-relay --config relay.toml --print-identity
+# Restart mask-authority after editing.
+
+[[relay]]
+nickname = "entry1"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "entry"
+
+[[relay]]
+nickname = "rv1"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "rendezvous"
+
+[[relay]]
+nickname = "middle1"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "middle"
+
+[[relay]]
+nickname = "rv2"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "rendezvous"
+
+[[relay]]
+nickname = "entry2"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "entry"
+
+[[relay]]
+nickname = "middle2"
+identity = "REPLACE_WITH_OUTPUT_OF_mask-relay_--print-identity"
+role = "middle"

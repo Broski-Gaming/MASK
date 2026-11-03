@@ -1,0 +1,18 @@
+# MORP testnet trust anchor. Copy this SAME file to every machine yourself
+# (USB stick, scp over SSH). Never download it from the network.
+#
+# name:  any label; consensus documents for other networks are rejected.
+# scope: "private" = loopback + 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7.
+#        Public addresses are always refused; there is no "public" scope.
+name = "mask-lan"
+scope = "private"
+
+# One block per directory authority. Generate the real block on the
+# authority machine with:
+#   mask-authority keys --data-dir /var/lib/mask/authority --name auth1 --address 192.168.1.10:7300
+# and paste its output here, replacing this example.
+[[authority]]
+name = "auth1"
+address = "192.168.1.10:7300"
+identity = "REPLACE_WITH_THE_IDENTITY_PRINTED_BY_mask-authority_keys"
+link_key = "REPLACE_WITH_THE_LINK_KEY_PRINTED_BY_mask-authority_keys"
