@@ -86,7 +86,7 @@ Spec and threat model: `docs/MORP_HIDDEN_SERVICES.md`.
 - [x] v0.5 — Relay-routed `.morp` hidden services: rendezvous-role relays, introduction points, rendezvous joins, encrypted introductions, service authentication, end-to-end encrypted multiplexed sessions, descriptor v2 (no location), browser loads full sites via MORP, no-bypass/auth/failure/cleanup tests. Direct v0.4 path removed. Unreviewed, localhost only.
 - [x] v0.5 verified (2026-11-01): addresses, relay-only routing, separate joined circuits, no direct connections, safe failure with disconnected and malicious (tampering/black-holing) relays; 141 tests. Report in `docs/PROGRESS.md`.
 - [x] v0.6 (2026-11-02) — Distributed MORP testnet: private network scope, Noise-authenticated links, `mask-authority` (allowlist, identity-change refusal, health probes, signed expiring consensus, `.morp` directory), TOML configs (`deploy/`), keepalives, link limits, graceful shutdown, family-aware paths with retries, intro-point re-establishment, browser network mode (`MASK_NETWORK`). Verified with multiple processes and Linux network namespaces (`scripts/netns-testnet.sh`); 194 tests. Docs: `docs/DISTRIBUTED_NETWORK.md`. Unreviewed.
-- [ ] v0.6 LAN trial on separate physical machines (procedure in `docs/DISTRIBUTED_NETWORK.md` §4–§5), recorded in `docs/PROGRESS.md`.
+- [ ] v0.6 LAN trial on separate physical machines (procedure in `docs/DISTRIBUTED_NETWORK.md` §4–§5), recorded in `docs/PROGRESS.md`. Planned as a two-machine trial: the PC plus the Chromebook (see "Testnet Hardware").
 - [ ] Later: multiple authorities with threshold signatures; entry guards; fixed-size cells and padding; circuit-routed descriptor lookups; encrypted/blinded service descriptors; introduction rate limits; browser circuit status panel; fuzzing; external security review before any public deployment.
 
 ## Distributed Testnet Rules (v0.6)
@@ -99,6 +99,13 @@ Architecture and operator guide: `docs/DISTRIBUTED_NETWORK.md` (keep in sync wit
 - Two modes: local (`runtime/directory/` folder + HTTP `mask-directory`, one machine) and network (`--config relay.toml`, `--network network.toml`, `MASK_NETWORK`). Both must keep working.
 - Authority and relay private keys: mode 0600, git-ignored, never committed. Testnet files for real machines live outside the repo (e.g. `~/morp-testnet/`).
 - Testing: `tests/testnet.rs` (in-process testnet), `tests/processes.rs` (real binaries), `scripts/netns-testnet.sh` / `tests/netns.rs --ignored` (network namespaces, no root).
+
+## Testnet Hardware
+- **Machine A — main PC** (Arch Linux, KDE Plasma, NVIDIA GPU). Runs everything today. Multi-machine testing on it uses Linux network namespaces (`scripts/netns-testnet.sh`).
+- **Machine B — Acer Chromebook 311 (C733), planned.** Not set up yet. Plan: confirm the board name with `crossystem hwid` (believed to be BOBBA, Gemini Lake "Octopus"; verify on mrchromebox.tech), flash MrChromebox UEFI Full ROM (save the stock firmware backup), install EndeavourOS with Xfce. Expected: Celeron N4000/N4020, ~4 GB RAM, ~32 GB eMMC; audio may need the chromebook-linux-audio script (irrelevant for relays).
+- Role of machine B: middle + rendezvous relays (headless is fine), family `machine-b`. Machine A keeps the authority, entry relay, hidden service, and MASK Browser.
+- Do not build on the Chromebook: build `cargo build --release -p mask-net` on the PC and copy `mask-relay`, `mask-authority`, `mask-service` (both x86_64, Arch-based). The Chromebook needs no Rust or WebKit.
+- Keep machine B plugged in with sleep disabled; clocks must agree within 5 minutes (chrony / timesyncd).
 
 ## Project Documentation
 
