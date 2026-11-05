@@ -1,10 +1,15 @@
 //! Signed consensus documents.
 //!
 //! ```text
-//! body      = postcard(version, network, sequence, valid_after, fresh_until,
-//!                      valid_until, [relay descriptor (binary, self-signed)])
-//! signature = Ed25519(authority identity, "MORP-v3 consensus\0" || body)
+//! body      = postcard(format = 2, network, sequence, valid_after, fresh_until,
+//!                      valid_until, [entry])
+//! entry     = (relay descriptor (binary, self-signed), operator, listed_since)
+//! signature = Ed25519(authority identity, "MORP-v3 consensus v2\0" || body)
 //! ```
+//!
+//! `operator` and `listed_since` are assigned by the authority (v0.7): who
+//! runs the relay (from `approved-relays.toml`) and when the authority first
+//! listed it. The authority's signature covers them; the relay's does not.
 //!
 //! A client accepts a consensus only if **all** of these hold:
 //! - at least one signature verifies under an authority key pinned in its
@@ -12,6 +17,9 @@
 //! - the network name matches;
 //! - `valid_after - skew <= now <= valid_until + skew`;
 //! - every relay descriptor verifies under its own identity key;
+//! - no two entries share an identity, nickname, address, onion key, or link
+//!   key (an honest authority never signs that; v0.7);
+//! - it is valid for at most [`MAX_LIFETIME`] and lists nobody "in the future";
 //! - its sequence is newer than the consensus it already has
 //!   (checked by [`TrustedRelays::install_consensus`]).
 //!
@@ -23,10 +31,15 @@ use serde::{Deserialize, Serialize};
 use super::AuthorityKeys;
 use crate::NetError;
 use crate::config::NetworkConfig;
-use crate::descriptor::RelayDescriptor;
-use crate::protocol::{MORP_VERSION, decode, encode};
+use crate::descriptor::{MAX_FAMILY_LEN, RelayDescriptor, valid_label};
+use crate::protocol::{decode, encode};
 
-const DOMAIN: &[u8] = b"MORP-v3 consensus\0";
+const DOMAIN: &[u8] = b"MORP-v3 consensus v2\0";
+/// Consensus document format (v0.7 added operators and listing times).
+pub const CONSENSUS_FORMAT: u16 = 2;
+/// Longest a consensus may be valid, from `valid_after` to `valid_until`.
+/// A document valid for longer could be replayed for that long.
+pub const MAX_LIFETIME: u64 = 86_400;
 /// Most relays in one consensus (keeps the document inside one frame).
 pub const MAX_CONSENSUS_RELAYS: usize = 200;
 /// Tolerated clock difference between machines, in seconds.
@@ -40,7 +53,14 @@ struct Body {
     valid_after: u64,
     fresh_until: u64,
     valid_until: u64,
-    relays: Vec<Vec<u8>>,
+    relays: Vec<Entry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    descriptor: Vec<u8>,
+    operator: String,
+    listed_since: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,14 +111,30 @@ impl SignedConsensus {
                 "more than {MAX_CONSENSUS_RELAYS} relays"
             )));
         }
+        if let Some(d) = relays
+            .iter()
+            .find(|d| !valid_label(&d.operator, MAX_FAMILY_LEN))
+        {
+            return Err(NetError::InvalidConfig(format!(
+                "invalid operator label for {}",
+                d.nickname
+            )));
+        }
         let body = encode(&Body {
-            version: MORP_VERSION,
+            version: CONSENSUS_FORMAT,
             network: network.to_owned(),
             sequence: validity.sequence,
             valid_after: validity.valid_after,
             fresh_until: validity.fresh_until,
             valid_until: validity.valid_until,
-            relays: relays.iter().map(RelayDescriptor::to_wire).collect(),
+            relays: relays
+                .iter()
+                .map(|d| Entry {
+                    descriptor: d.to_wire(),
+                    operator: d.operator.clone(),
+                    listed_since: d.listed_since,
+                })
+                .collect(),
         });
         let mut message = DOMAIN.to_vec();
         message.extend_from_slice(&body);
@@ -152,9 +188,9 @@ impl SignedConsensus {
 
         let body: Body =
             decode(&self.body).map_err(|e| untrusted(format!("malformed body: {e}")))?;
-        if body.version != MORP_VERSION {
+        if body.version != CONSENSUS_FORMAT {
             return Err(untrusted(format!(
-                "MORP version {} not supported",
+                "consensus format {} not supported (need {CONSENSUS_FORMAT})",
                 body.version
             )));
         }
@@ -173,15 +209,33 @@ impl SignedConsensus {
         if now > body.valid_until + CLOCK_SKEW {
             return Err(untrusted("expired".into()));
         }
+        if body.valid_until - body.valid_after > MAX_LIFETIME {
+            return Err(untrusted(format!(
+                "valid for {} s; at most {MAX_LIFETIME} s is accepted",
+                body.valid_until - body.valid_after
+            )));
+        }
         if body.relays.len() > MAX_CONSENSUS_RELAYS {
             return Err(untrusted("too many relays".into()));
         }
-        let relays = body
-            .relays
-            .iter()
-            .map(|wire| RelayDescriptor::from_wire(wire))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| untrusted(e.to_string()))?;
+        let mut relays = Vec::with_capacity(body.relays.len());
+        for entry in &body.relays {
+            let mut d = RelayDescriptor::from_wire(&entry.descriptor)
+                .map_err(|e| untrusted(e.to_string()))?;
+            if !valid_label(&entry.operator, MAX_FAMILY_LEN) {
+                return Err(untrusted(format!("invalid operator for {}", d.nickname)));
+            }
+            if entry.listed_since > body.valid_after + CLOCK_SKEW {
+                return Err(untrusted(format!(
+                    "{} is listed since a time after the consensus",
+                    d.nickname
+                )));
+            }
+            d.operator = entry.operator.clone();
+            d.listed_since = entry.listed_since;
+            relays.push(d);
+        }
+        check_unique(&relays).map_err(untrusted)?;
         Ok(Consensus {
             network: body.network,
             sequence: body.sequence,
@@ -192,6 +246,37 @@ impl SignedConsensus {
             signed_by,
         })
     }
+}
+
+/// No two relays may share an identity, nickname, address, onion key, or
+/// link key. Shared keys or addresses would let one relay borrow another's
+/// liveness, or be mistaken for it when a link key is looked up. An honest
+/// authority refuses such uploads, so a consensus containing them is not
+/// trusted at all.
+pub fn check_unique(relays: &[RelayDescriptor]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut ids = HashSet::new();
+    let mut nicks = HashSet::new();
+    let mut addrs = HashSet::new();
+    let mut onion = HashSet::new();
+    let mut link = HashSet::new();
+    for d in relays {
+        let clash = if !ids.insert(d.node_id) {
+            "identity"
+        } else if !nicks.insert(d.nickname.as_str()) {
+            "nickname"
+        } else if !addrs.insert(d.addr) {
+            "address"
+        } else if !onion.insert(d.onion_key) {
+            "onion key"
+        } else if !link.insert(d.link_key) {
+            "link key"
+        } else {
+            continue;
+        };
+        return Err(format!("two relays share a {clash} ({})", d.nickname));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,6 +297,7 @@ mod tests {
                 identity: keys.identity_public(),
                 link_key: keys.link_public(),
             }],
+            relay_policy: crate::config::RelayPolicy::default_for(NetworkScope::Private),
         }
     }
 
@@ -293,6 +379,70 @@ mod tests {
         assert!(doc.verify(&net, NOW + 600).is_ok());
         let other = SignedConsensus::sign(&keys, "othernet", validity(NOW), &[]).unwrap();
         assert!(other.verify(&net, NOW).is_err(), "wrong network");
+    }
+
+    #[test]
+    fn operator_and_listing_time_travel_under_the_authority_signature() {
+        let keys = AuthorityKeys::generate();
+        let mut d = relay();
+        d.operator = "alice".into();
+        d.listed_since = NOW - 3600;
+        let doc = SignedConsensus::sign(&keys, "testnet", validity(NOW), &[d.clone()]).unwrap();
+        let consensus = doc.verify(&network(&keys), NOW).unwrap();
+        assert_eq!(consensus.relays[0].operator, "alice");
+        assert_eq!(consensus.relays[0].listed_since, NOW - 3600);
+        // The relay's own signature does not cover them, the authority's does:
+        // changing them breaks the consensus signature.
+        let mut tampered = doc.clone();
+        let pos = tampered
+            .body
+            .windows(5)
+            .position(|w| w == b"alice")
+            .unwrap();
+        tampered.body[pos] = b'm';
+        assert!(tampered.verify(&network(&keys), NOW).is_err());
+    }
+
+    #[test]
+    fn hostile_consensus_contents_are_rejected() {
+        // Regression (v0.7): a consensus could list two relays sharing a
+        // link key or address, or be valid for years.
+        let keys = AuthorityKeys::generate();
+        let net = network(&keys);
+        let honest = relay();
+        let sybil_keys = RelayKeys::generate();
+        let shares_link = RelayDescriptor::sign_claiming(
+            &sybil_keys,
+            "sybil",
+            Role::Entry,
+            "10.0.0.3:7101".parse().unwrap(),
+            "",
+            sybil_keys.onion_public(),
+            honest.link_key,
+        );
+        let shares_addr =
+            RelayDescriptor::sign(&RelayKeys::generate(), "sybil2", Role::Middle, honest.addr);
+        for (twin, what) in [(shares_link, "link key"), (shares_addr, "address")] {
+            let doc =
+                SignedConsensus::sign(&keys, "testnet", validity(NOW), &[honest.clone(), twin])
+                    .unwrap();
+            let err = doc.verify(&net, NOW).unwrap_err().to_string();
+            assert!(err.contains(what), "{err}");
+        }
+
+        let forever = Validity {
+            sequence: 1,
+            valid_after: NOW,
+            fresh_until: NOW + 60,
+            valid_until: NOW + 10 * 365 * 86_400,
+        };
+        let doc = SignedConsensus::sign(&keys, "testnet", forever, &[]).unwrap();
+        assert!(doc.verify(&net, NOW).is_err(), "decade-long consensus");
+
+        let mut future = relay();
+        future.listed_since = NOW + 86_400;
+        let doc = SignedConsensus::sign(&keys, "testnet", validity(NOW), &[future]).unwrap();
+        assert!(doc.verify(&net, NOW).is_err(), "listed in the future");
     }
 
     #[test]

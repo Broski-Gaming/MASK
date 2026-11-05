@@ -92,6 +92,15 @@ struct NetworkFile {
     scope: NetworkScope,
     #[serde(rename = "authority")]
     authorities: Vec<AuthorityEntry>,
+    #[serde(default)]
+    relay_policy: RelayPolicyFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayPolicyFile {
+    max_relays_per_ip: Option<usize>,
+    guard_min_listed_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +129,37 @@ pub struct NetworkConfig {
     pub name: String,
     pub scope: NetworkScope,
     pub authorities: Vec<AuthorityInfo>,
+    pub relay_policy: RelayPolicy,
+}
+
+/// Network-wide rules against relay concentration (v0.7), from the
+/// optional `[relay_policy]` table of `network.toml`. Because every machine
+/// has the same `network.toml`, the authority and every client apply the
+/// same numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayPolicy {
+    /// Most relays one IP address may run (`None`: no limit). The
+    /// authority refuses more; clients drop extras from a consensus.
+    /// Default: 2 in the private scope, unlimited in loopback (where every
+    /// relay shares 127.0.0.1 or 127.x addresses on one machine anyway).
+    pub max_relays_per_ip: Option<usize>,
+    /// New entry guards are chosen among entry relays that have been listed
+    /// by the authority for at least this long, when any exist (so relays
+    /// added in a hurry, for example by an attacker, are not picked first).
+    pub guard_min_listed_secs: u64,
+}
+
+impl RelayPolicy {
+    /// Defaults for a scope.
+    pub fn default_for(scope: NetworkScope) -> Self {
+        Self {
+            max_relays_per_ip: match scope {
+                NetworkScope::Loopback => None,
+                NetworkScope::Private => Some(2),
+            },
+            guard_min_listed_secs: 3600,
+        }
+    }
 }
 
 impl NetworkConfig {
@@ -147,10 +187,21 @@ impl NetworkConfig {
             }
             authorities.push(info);
         }
+        let mut relay_policy = RelayPolicy::default_for(file.scope);
+        if let Some(n) = file.relay_policy.max_relays_per_ip {
+            if n == 0 {
+                return Err(invalid(path, "max_relays_per_ip must be at least 1"));
+            }
+            relay_policy.max_relays_per_ip = Some(n);
+        }
+        if let Some(secs) = file.relay_policy.guard_min_listed_secs {
+            relay_policy.guard_min_listed_secs = secs;
+        }
         Ok(Self {
             name: file.name,
             scope: file.scope,
             authorities,
+            relay_policy,
         })
     }
 
@@ -397,6 +448,9 @@ struct ApprovedEntry {
     nickname: String,
     identity: String,
     role: Role,
+    family: Option<String>,
+    #[serde(default)]
+    operator: String,
 }
 
 /// One allowlisted relay.
@@ -405,6 +459,14 @@ pub struct ApprovedRelay {
     pub nickname: String,
     pub identity: NodeId,
     pub role: Role,
+    /// The machine label the relay must declare (v0.7). Bound here so a
+    /// relay cannot pretend to be on a machine of its own and defeat path
+    /// diversity.
+    pub family: String,
+    /// Who runs the relay (person or organisation), assigned by the
+    /// authority operator and published in the consensus. Empty: unknown.
+    /// Paths avoid two relays of one operator, as they avoid one family.
+    pub operator: String,
 }
 
 /// The authority's relay allowlist. Each nickname is bound to exactly one
@@ -429,6 +491,17 @@ impl ApprovedRelays {
                     format!("{}: role must be a relay role", r.nickname),
                 ));
             }
+            let family = r.family.ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "{}: family is required (the machine label from its relay.toml; v0.7)",
+                        r.nickname
+                    ),
+                )
+            })?;
+            check_label(path, "family", &family, MAX_FAMILY_LEN, true)?;
+            check_label(path, "operator", &r.operator, MAX_FAMILY_LEN, true)?;
             let identity = NodeId::from_bytes(hex32(path, "identity", &r.identity)?);
             if !nicknames.insert(r.nickname.clone()) || !identities.insert(identity) {
                 return Err(invalid(
@@ -440,6 +513,8 @@ impl ApprovedRelays {
                 nickname: r.nickname,
                 identity,
                 role: r.role,
+                family,
+                operator: r.operator,
             });
         }
         Ok(Self { relays })
@@ -543,19 +618,32 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "[[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_A}\"\nrole = \"entry\"\n\
-                 [[relay]]\nnickname = \"middle1\"\nidentity = \"{KEY_B}\"\nrole = \"middle\"\n"
+                "[[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_A}\"\nrole = \"entry\"\nfamily = \"machine-a\"\n\
+                 [[relay]]\nnickname = \"middle1\"\nidentity = \"{KEY_B}\"\nrole = \"middle\"\nfamily = \"machine-b\"\noperator = \"alice\"\n"
             ),
         )
         .unwrap();
         let approved = ApprovedRelays::load(&path).unwrap();
-        assert_eq!(approved.by_nickname("middle1").unwrap().role, Role::Middle);
+        let middle = approved.by_nickname("middle1").unwrap();
+        assert_eq!(middle.role, Role::Middle);
+        assert_eq!(middle.family, "machine-b");
+        assert_eq!(middle.operator, "alice");
+        assert_eq!(approved.by_nickname("entry1").unwrap().operator, "");
+
+        // v0.7: the family is bound in the allowlist, so it is required.
+        fs::write(
+            &path,
+            format!("[[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_A}\"\nrole = \"entry\"\n"),
+        )
+        .unwrap();
+        let err = ApprovedRelays::load(&path).unwrap_err().to_string();
+        assert!(err.contains("family is required"), "{err}");
 
         fs::write(
             &path,
             format!(
-                "[[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_A}\"\nrole = \"entry\"\n\
-                 [[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_B}\"\nrole = \"entry\"\n"
+                "[[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_A}\"\nrole = \"entry\"\nfamily = \"a\"\n\
+                 [[relay]]\nnickname = \"entry1\"\nidentity = \"{KEY_B}\"\nrole = \"entry\"\nfamily = \"b\"\n"
             ),
         )
         .unwrap();

@@ -468,6 +468,7 @@ async fn authority_limits_connections_per_address() {
             identity: keys.identity_public(),
             link_key: keys.link_public(),
         }],
+        relay_policy: mask_net::config::RelayPolicy::default_for(NetworkScope::Loopback),
     };
     let mut config =
         AuthorityConfig::new("auth1", addr, network.clone(), ApprovedRelays::default());

@@ -225,6 +225,7 @@ impl TrustedRelays {
             }
             accepted.push(d);
         }
+        drop_conflicts(&mut accepted);
         accepted.sort_by(|a, b| a.nickname.cmp(&b.nickname));
         accepted
     }
@@ -317,6 +318,59 @@ impl TrustedRelays {
     pub fn find_by_link_key(&self, key: &[u8; 32]) -> Option<RelayDescriptor> {
         self.find_where(|d| d.link_key == *key)
     }
+}
+
+/// Remove every relay that shares an address, onion key, or link key with
+/// a relay of another identity (v0.7). All of them are removed: from the
+/// outside there is no telling which one is genuine, and a relay using
+/// another's address or link key could borrow its liveness or be mistaken
+/// for it when an incoming link key is looked up. Signed consensuses never
+/// contain such pairs (they are rejected whole); folders might.
+fn drop_conflicts(relays: &mut Vec<RelayDescriptor>) {
+    let clashes = |a: &RelayDescriptor, b: &RelayDescriptor| {
+        a.node_id != b.node_id
+            && (a.addr == b.addr || a.link_key == b.link_key || a.onion_key == b.onion_key)
+    };
+    let bad: Vec<NodeId> = relays
+        .iter()
+        .filter(|a| relays.iter().any(|b| clashes(a, b)))
+        .map(|d| d.node_id)
+        .collect();
+    if !bad.is_empty() {
+        for d in relays.iter().filter(|d| bad.contains(&d.node_id)) {
+            warn!(relay = %d.nickname, "dropping relay that shares an address or key with another relay");
+        }
+        relays.retain(|d| !bad.contains(&d.node_id));
+    }
+}
+
+/// Keep at most `max` relays per IP address (v0.7, from `network.toml`
+/// `[relay_policy] max_relays_per_ip`): the ones listed longest, then by
+/// identity, so every client keeps the same ones. The authority enforces
+/// the same limit; this is defence in depth against a misconfigured or
+/// careless authority (a malicious one can simply use more addresses).
+pub fn cap_per_ip(mut relays: Vec<RelayDescriptor>, max: Option<usize>) -> Vec<RelayDescriptor> {
+    let Some(max) = max else { return relays };
+    relays.sort_by(|a, b| {
+        (a.listed_since == 0, a.listed_since, a.node_id.as_bytes()).cmp(&(
+            b.listed_since == 0,
+            b.listed_since,
+            b.node_id.as_bytes(),
+        ))
+    });
+    let mut per_ip: HashMap<std::net::IpAddr, usize> = HashMap::new();
+    relays.retain(|d| {
+        let count = per_ip.entry(d.addr.ip()).or_insert(0);
+        *count += 1;
+        if *count > max {
+            warn!(relay = %d.nickname, ip = %d.addr.ip(), max, "dropping relay beyond the per-address limit");
+            false
+        } else {
+            true
+        }
+    });
+    relays.sort_by(|a, b| a.nickname.cmp(&b.nickname));
+    relays
 }
 
 /// Relays that failed recently, shared by everything using one
@@ -433,6 +487,54 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn relays_sharing_an_address_or_key_with_another_identity_are_all_dropped() {
+        // Regression (v0.7): a relay could publish another relay's link key
+        // and address and be trusted as a separate relay.
+        let trusted = TrustedRelays::consensus(NetworkScope::Loopback);
+        let until = crate::service::now_secs() + 600;
+        let (_, honest) = relay("honest", "127.0.0.1:7102");
+        let (_, bystander) = relay("bystander", "127.0.0.1:7103");
+        let sybil_keys = RelayKeys::generate();
+        let copycat = RelayDescriptor::sign_claiming(
+            &sybil_keys,
+            "copycat",
+            Role::Middle,
+            "127.0.0.1:7999".parse().unwrap(),
+            "",
+            sybil_keys.onion_public(),
+            honest.link_key,
+        );
+        let installed = trusted
+            .install_consensus(1, until, until, vec![honest.clone(), copycat, bystander])
+            .unwrap();
+        assert_eq!(installed, 1);
+        assert!(trusted.find_by_link_key(&honest.link_key).is_none());
+        assert_eq!(
+            trusted.snapshot().unwrap().relays()[0].nickname,
+            "bystander"
+        );
+    }
+
+    #[test]
+    fn per_address_cap_keeps_the_longest_listed_relays() {
+        let at = |nick: &str, addr: &str, since: u64| {
+            let (_, mut d) = relay(nick, addr);
+            d.listed_since = since;
+            d
+        };
+        let relays = vec![
+            at("new", "10.0.0.5:7001", 900),
+            at("old", "10.0.0.5:7002", 100),
+            at("older", "10.0.0.5:7003", 50),
+            at("elsewhere", "10.0.0.6:7001", 999),
+        ];
+        let kept = cap_per_ip(relays.clone(), Some(2));
+        let names: Vec<_> = kept.iter().map(|d| d.nickname.as_str()).collect();
+        assert_eq!(names, ["elsewhere", "old", "older"]);
+        assert_eq!(cap_per_ip(relays, None).len(), 4);
     }
 
     #[test]

@@ -180,6 +180,10 @@ pub struct RelayStatus {
     pub role: Role,
     pub address: std::net::SocketAddr,
     pub family: String,
+    /// Authority-assigned operator (empty: unknown).
+    pub operator: String,
+    /// How long ago the authority first listed the relay.
+    pub listed_for_secs: Option<u64>,
     /// In the current consensus (passed its latest health probes).
     pub running: bool,
     pub consecutive_probe_failures: u32,

@@ -16,3 +16,10 @@ name = "auth1"
 address = "192.168.1.10:7300"
 identity = "REPLACE_WITH_THE_IDENTITY_PRINTED_BY_mask-authority_keys"
 link_key = "REPLACE_WITH_THE_LINK_KEY_PRINTED_BY_mask-authority_keys"
+
+# Optional (v0.7): network-wide rules against relay concentration. Every
+# machine has this same file, so the authority and every client apply the
+# same numbers.
+[relay_policy]
+max_relays_per_ip = 2          # the authority admits at most this many relays per IP address
+guard_min_listed_secs = 3600   # new entry guards prefer relays listed at least this long

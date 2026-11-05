@@ -100,12 +100,14 @@ fn load_keys(data_dir: &std::path::Path) -> Result<RelayKeys, String> {
         .map_err(|e| format!("cannot load identity key from {}: {e}", data_dir.display()))
 }
 
-fn print_identity(nickname: &str, role: Role, keys: &RelayKeys) {
+fn print_identity(nickname: &str, role: Role, family: &str, keys: &RelayKeys) {
     println!("# Add this to the authority's approved-relays.toml:");
     println!("[[relay]]");
     println!("nickname = \"{nickname}\"");
     println!("identity = \"{}\"", keys.node_id());
     println!("role = \"{role}\"");
+    println!("family = \"{family}\"");
+    println!("# operator = \"who runs this machine\"   (optional; set by the authority operator)");
 }
 
 async fn run_local(args: &Args) -> Result<(), String> {
@@ -122,7 +124,7 @@ async fn run_local(args: &Args) -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from("runtime/directory"));
     let keys = load_keys(&data_dir)?;
     if args.print_identity {
-        print_identity(&name, role, &keys);
+        print_identity(&name, role, "", &keys);
         return Ok(());
     }
 
@@ -159,7 +161,7 @@ async fn run_network(args: &Args, path: PathBuf) -> Result<(), String> {
         .unwrap_or_else(|| file.data_dir.clone());
     let keys = load_keys(&data_dir)?;
     if args.print_identity {
-        print_identity(&file.nickname, file.role, &keys);
+        print_identity(&file.nickname, file.role, &file.family, &keys);
         return Ok(());
     }
     let scope = file.network.scope;

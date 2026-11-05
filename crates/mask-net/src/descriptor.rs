@@ -57,6 +57,13 @@ pub struct RelayDescriptor {
     /// Unix time (seconds) when the descriptor was signed.
     pub published: u64,
     signature: [u8; 64],
+    /// Who runs the relay, as assigned by the directory authority (v0.7).
+    /// **Not** covered by the relay's own signature: it comes from the
+    /// consensus, which the authority signs. Empty: unknown (local mode).
+    pub operator: String,
+    /// Unix time when the authority first listed this relay (v0.7), from
+    /// the consensus. 0: unknown (local mode).
+    pub listed_since: u64,
 }
 
 /// The fields covered by the signature, in a fixed binary encoding.
@@ -115,6 +122,30 @@ impl RelayDescriptor {
         addr: SocketAddr,
         family: &str,
     ) -> Self {
+        Self::sign_claiming(
+            keys,
+            nickname,
+            role,
+            addr,
+            family,
+            keys.onion_public(),
+            keys.link_public(),
+        )
+    }
+
+    /// Sign a descriptor that claims arbitrary onion and link keys. Real
+    /// relays never do this; it exists so tests can play a hostile relay
+    /// that copies another relay's keys (anyone can publish someone else's
+    /// *public* keys, so this gives an attacker nothing new).
+    pub fn sign_claiming(
+        keys: &RelayKeys,
+        nickname: &str,
+        role: Role,
+        addr: SocketAddr,
+        family: &str,
+        onion_key: [u8; 32],
+        link_key: [u8; 32],
+    ) -> Self {
         let published = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -124,11 +155,13 @@ impl RelayDescriptor {
             role,
             addr,
             node_id: keys.node_id(),
-            onion_key: keys.onion_public(),
-            link_key: keys.link_public(),
+            onion_key,
+            link_key,
             family: family.to_owned(),
             published,
             signature: [0; 64],
+            operator: String::new(),
+            listed_since: 0,
         };
         descriptor.signature = keys.sign(&descriptor.signed_bytes());
         descriptor
@@ -214,6 +247,8 @@ impl RelayDescriptor {
                 .signature
                 .try_into()
                 .map_err(|_| NetError::Descriptor("malformed signature".into()))?,
+            operator: String::new(),
+            listed_since: 0,
         };
         descriptor.verify().map_err(|_| {
             NetError::Descriptor(format!("bad signature on {}", descriptor.nickname))
@@ -228,6 +263,32 @@ impl RelayDescriptor {
             format!("id:{}", self.node_id)
         } else {
             self.family.clone()
+        }
+    }
+
+    /// The operator used for path diversity: the authority-assigned one, or
+    /// the relay's own identity if unknown.
+    pub fn operator_key(&self) -> String {
+        if self.operator.is_empty() {
+            format!("id:{}", self.node_id)
+        } else {
+            self.operator.clone()
+        }
+    }
+
+    /// The network the relay's address belongs to, for path diversity: the
+    /// IPv4 /16 or the IPv6 /32 (as Tor uses). Relays on one network are
+    /// more likely to be watched by the same observer.
+    pub fn subnet_key(&self) -> String {
+        match self.addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                let [a, b, _, _] = ip.octets();
+                format!("{a}.{b}.0.0/16")
+            }
+            std::net::IpAddr::V6(ip) => {
+                let s = ip.segments();
+                format!("{:x}:{:x}::/32", s[0], s[1])
+            }
         }
     }
 
@@ -252,6 +313,8 @@ impl RelayDescriptor {
             family: file.family,
             published: file.published,
             signature: from_hex(&file.signature).ok_or_else(|| bad("signature"))?,
+            operator: String::new(),
+            listed_since: 0,
         };
         descriptor.verify().map_err(|_| {
             NetError::Descriptor(format!("bad signature on {}", descriptor.nickname))

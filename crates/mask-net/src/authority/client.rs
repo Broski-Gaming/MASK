@@ -139,11 +139,15 @@ impl AuthorityClient {
         {
             return Ok(None);
         }
+        let relays = crate::trust::cap_per_ip(
+            consensus.relays,
+            self.network.relay_policy.max_relays_per_ip,
+        );
         let installed = trusted.install_consensus(
             consensus.sequence,
             consensus.fresh_until,
             consensus.valid_until + CLOCK_SKEW,
-            consensus.relays,
+            relays,
         )?;
         debug!(
             sequence = consensus.sequence,

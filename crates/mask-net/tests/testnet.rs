@@ -22,7 +22,7 @@ use mask_net::authority::AuthorityKeys;
 use mask_net::authority::client::AuthorityClient;
 use mask_net::authority::server::{Authority, AuthorityConfig, AuthorityHandle};
 use mask_net::client::ClientLink;
-use mask_net::config::{ApprovedRelay, ApprovedRelays, AuthorityInfo, NetworkConfig};
+use mask_net::config::{ApprovedRelay, ApprovedRelays, AuthorityInfo, NetworkConfig, RelayPolicy};
 use mask_net::crypto::keys::RelayKeys;
 use mask_net::descriptor::{CircuitPath, RelayDescriptor};
 use mask_net::hs::app::serve_site;
@@ -64,6 +64,7 @@ struct RelaySpec {
     nick: &'static str,
     role: Role,
     family: &'static str,
+    operator: &'static str,
 }
 
 const SPECS: [RelaySpec; 6] = [
@@ -71,31 +72,37 @@ const SPECS: [RelaySpec; 6] = [
         nick: "entry1",
         role: Role::Entry,
         family: "machine-a",
+        operator: "op-a",
     },
     RelaySpec {
         nick: "entry2",
         role: Role::Entry,
         family: "machine-b",
+        operator: "op-b",
     },
     RelaySpec {
         nick: "middle1",
         role: Role::Middle,
         family: "machine-c",
+        operator: "op-c",
     },
     RelaySpec {
         nick: "middle2",
         role: Role::Middle,
         family: "machine-d",
+        operator: "op-d",
     },
     RelaySpec {
         nick: "rv1",
         role: Role::Rendezvous,
         family: "machine-e",
+        operator: "op-e",
     },
     RelaySpec {
         nick: "rv2",
         role: Role::Rendezvous,
         family: "machine-f",
+        operator: "op-f",
     },
 ];
 
@@ -149,6 +156,12 @@ impl Testnet {
     }
 
     async fn start(specs: &[RelaySpec]) -> Testnet {
+        Self::start_with(specs, Vec::new()).await
+    }
+
+    /// Like [`start`](Self::start), with `extra` relays approved by the
+    /// authority but not started (tests publish descriptors for them).
+    async fn start_with(specs: &[RelaySpec], extra: Vec<ApprovedRelay>) -> Testnet {
         // MASK_TEST_LOG=1 prints relay/host logs (debugging aid).
         if std::env::var_os("MASK_TEST_LOG").is_some() {
             let _ = tracing_subscriber::fmt()
@@ -187,7 +200,10 @@ impl Testnet {
                     nickname: s.nick.into(),
                     identity: k.node_id(),
                     role: s.role,
+                    family: s.family.into(),
+                    operator: s.operator.into(),
                 })
+                .chain(extra)
                 .collect(),
         };
 
@@ -207,6 +223,7 @@ impl Testnet {
                 identity: auth_keys.identity_public(),
                 link_key: auth_keys.link_public(),
             }],
+            relay_policy: RelayPolicy::default_for(NetworkScope::Private),
         };
         let mut config = AuthorityConfig::new("auth1", authority_addr, network.clone(), approved);
         config.timeouts = timeouts();
@@ -471,12 +488,15 @@ async fn relay_with_a_wrong_role_or_out_of_scope_address_is_refused() {
             identity: auth_keys.identity_public(),
             link_key: auth_keys.link_public(),
         }],
+        relay_policy: RelayPolicy::default_for(NetworkScope::Private),
     };
     let approved = ApprovedRelays {
         relays: vec![ApprovedRelay {
             nickname: "e1".into(),
             identity: keys.node_id(),
             role: Role::Entry,
+            family: String::new(),
+            operator: String::new(),
         }],
     };
     let authority = Authority::bind(
@@ -801,4 +821,129 @@ async fn connections_from_outside_the_scope_are_refused() {
         .err()
         .unwrap();
     assert!(matches!(err, NetError::OutOfScope { .. }), "{err:?}");
+}
+
+// =========================================== v0.7: coordinated relay identities
+
+fn approve(keys: &RelayKeys, nickname: &str, role: Role, family: &str) -> ApprovedRelay {
+    ApprovedRelay {
+        nickname: nickname.into(),
+        identity: keys.node_id(),
+        role,
+        family: family.into(),
+        operator: String::new(),
+    }
+}
+
+fn refusal(results: Vec<(String, Result<String, NetError>)>) -> String {
+    match results.into_iter().next().unwrap().1 {
+        Ok(ok) => panic!("upload was accepted: {ok}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn approved_relay_claiming_a_machine_of_its_own_is_refused() {
+    // Regression (v0.7): families were self-declared, so one machine could
+    // run relays that each claimed a different family and defeat the
+    // "three families per circuit" rule.
+    let keys = RelayKeys::generate();
+    let net = Testnet::start_with(
+        &SPECS,
+        vec![approve(&keys, "liar", Role::Middle, "machine-c")],
+    )
+    .await;
+    let addr = SocketAddr::from(([127, 0, net.block as u8, 60], 7102));
+    let d = RelayDescriptor::sign_with_family(&keys, "liar", Role::Middle, addr, "machine-z");
+    let err = refusal(net.authorities("relay").publish_relay(&d).await);
+    assert!(err.contains("family"), "{err}");
+    assert_eq!(net.authority.stats().family_mismatches, 1);
+}
+
+#[tokio::test]
+async fn relay_borrowing_another_relays_address_and_link_key_is_never_listed() {
+    // Regression (v0.7): an approved relay could publish middle1's address
+    // and link key; the authority's probe then reached middle1, which
+    // answered, and the copycat was listed as a healthy relay of its own.
+    let keys = RelayKeys::generate();
+    let net = Testnet::start_with(
+        &SPECS,
+        vec![approve(&keys, "copycat", Role::Middle, "machine-x")],
+    )
+    .await;
+    let victim = net.relay("middle1").descriptor.clone();
+    let copycat = RelayDescriptor::sign_claiming(
+        &keys,
+        "copycat",
+        Role::Middle,
+        victim.addr,
+        "machine-x",
+        keys.onion_public(),
+        victim.link_key,
+    );
+    let err = refusal(net.authorities("relay").publish_relay(&copycat).await);
+    assert!(err.contains("middle1"), "{err}");
+    // Only the link key copied, at an address of its own: also refused.
+    let elsewhere = SocketAddr::from(([127, 0, net.block as u8, 61], 7102));
+    let link_only = RelayDescriptor::sign_claiming(
+        &keys,
+        "copycat",
+        Role::Middle,
+        elsewhere,
+        "machine-x",
+        keys.onion_public(),
+        victim.link_key,
+    );
+    refusal(net.authorities("relay").publish_relay(&link_only).await);
+    net.converge().await;
+    let consensus = net.authorities("client").fetch_consensus().await.unwrap();
+    assert!(!consensus.relays.iter().any(|r| r.nickname == "copycat"));
+    assert_eq!(net.authority.stats().duplicates_refused, 2);
+}
+
+#[tokio::test]
+async fn the_authority_admits_at_most_two_relays_per_address() {
+    let crowd: Vec<RelayKeys> = (0..3).map(|_| RelayKeys::generate()).collect();
+    let approved = crowd
+        .iter()
+        .enumerate()
+        .map(|(i, k)| approve(k, &format!("crowd{i}"), Role::Middle, "crowd"))
+        .collect();
+    let net = Testnet::start_with(&SPECS, approved).await;
+    let client = net.authorities("relay");
+    for (i, keys) in crowd.iter().enumerate() {
+        let addr = SocketAddr::from(([127, 0, net.block as u8, 70], 7001 + i as u16));
+        let d = RelayDescriptor::sign_with_family(
+            keys,
+            &format!("crowd{i}"),
+            Role::Middle,
+            addr,
+            "crowd",
+        );
+        let result = client.publish_relay(&d).await.into_iter().next().unwrap().1;
+        if i < 2 {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("max_relays_per_ip"), "{err}");
+        }
+    }
+    assert_eq!(net.authority.stats().address_limit_refused, 1);
+}
+
+#[tokio::test]
+async fn consensus_carries_authority_assigned_operators_and_listing_times() {
+    let net = Testnet::start(&SPECS).await;
+    let consensus = net.authorities("client").fetch_consensus().await.unwrap();
+    let now = now_secs();
+    for spec in &SPECS {
+        let d = consensus
+            .relays
+            .iter()
+            .find(|d| d.nickname == spec.nick)
+            .unwrap();
+        assert_eq!(d.operator, spec.operator);
+        assert_eq!(d.family, spec.family);
+        assert!(d.listed_since > 0 && d.listed_since <= now + 1, "{d:?}");
+    }
 }

@@ -61,6 +61,9 @@ pub struct AuthorityConfig {
     /// Connections open at once from one IP address (v0.7), so one
     /// machine cannot take every connection slot.
     pub max_connections_per_ip: usize,
+    /// Where the authority remembers when it first listed each relay
+    /// (v0.7), so the history survives restarts. `None`: memory only.
+    pub state_file: Option<std::path::PathBuf>,
 }
 
 impl AuthorityConfig {
@@ -83,6 +86,7 @@ impl AuthorityConfig {
             policy: ConnectPolicy::allow_all(),
             max_connections: 256,
             max_connections_per_ip: 32,
+            state_file: None,
         }
     }
 }
@@ -102,6 +106,9 @@ struct Counters {
     probes_ok: AtomicU64,
     probes_failed: AtomicU64,
     consensuses_signed: AtomicU64,
+    family_mismatches: AtomicU64,
+    duplicates_refused: AtomicU64,
+    address_limit_refused: AtomicU64,
 }
 
 /// Counters, for tests and diagnostics.
@@ -114,6 +121,12 @@ pub struct AuthorityStats {
     pub probes_ok: u64,
     pub probes_failed: u64,
     pub consensuses_signed: u64,
+    /// Uploads whose family differs from the approved one.
+    pub family_mismatches: u64,
+    /// Uploads reusing another relay's address, link key, or onion key.
+    pub duplicates_refused: u64,
+    /// Uploads refused by the relays-per-IP limit.
+    pub address_limit_refused: u64,
 }
 
 struct Inner {
@@ -127,6 +140,8 @@ struct Inner {
     changed: Notify,
     connections: Arc<Semaphore>,
     connections_per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// When each relay was first listed (Unix seconds).
+    listed_since: Mutex<HashMap<NodeId, u64>>,
     counters: Counters,
     shutdown: CancellationToken,
     tasks: TaskTracker,
@@ -165,6 +180,10 @@ impl Authority {
                 config.name
             )));
         }
+        let listed_since = match &config.state_file {
+            Some(path) => load_listing_history(path)?,
+            None => HashMap::new(),
+        };
         let listener = TcpListener::bind(config.listen).await?;
         let policy = config.policy.clone().with_scope(scope);
         Ok(Self {
@@ -177,6 +196,7 @@ impl Authority {
                 changed: Notify::new(),
                 connections: Arc::new(Semaphore::new(config.max_connections)),
                 connections_per_ip: Mutex::new(HashMap::new()),
+                listed_since: Mutex::new(listed_since),
                 counters: Counters::default(),
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -273,6 +293,9 @@ impl AuthorityHandle {
             probes_ok: c.probes_ok.load(Ordering::Relaxed),
             probes_failed: c.probes_failed.load(Ordering::Relaxed),
             consensuses_signed: c.consensuses_signed.load(Ordering::Relaxed),
+            family_mismatches: c.family_mismatches.load(Ordering::Relaxed),
+            duplicates_refused: c.duplicates_refused.load(Ordering::Relaxed),
+            address_limit_refused: c.address_limit_refused.load(Ordering::Relaxed),
         }
     }
 
@@ -424,6 +447,21 @@ impl Inner {
                 ),
             );
         }
+        if approved.family != descriptor.family {
+            // A relay must not pretend to be on a machine of its own: that
+            // would defeat family-based path diversity (v0.7).
+            self.counters
+                .family_mismatches
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(relay = %descriptor.nickname, declared = %descriptor.family, approved = %approved.family, "refused relay with the wrong family");
+            return error(
+                DirErrorCode::NotApproved,
+                format!(
+                    "{} is approved with family \"{}\", not \"{}\"",
+                    descriptor.nickname, approved.family, descriptor.family
+                ),
+            );
+        }
         if let Err(e) = self.config.network.scope.check_reachable(descriptor.addr) {
             return error(DirErrorCode::Invalid, e.to_string());
         }
@@ -442,6 +480,51 @@ impl Inner {
 
         let id = descriptor.node_id;
         let mut relays = self.relays.lock().unwrap();
+        // Another identity at the same address, or with the same keys,
+        // would borrow that relay's health probes (its liveness) and could
+        // be mistaken for it. Refused (v0.7): first come, first served.
+        if let Some(other) = relays.values().find(|r| {
+            r.descriptor.node_id != id
+                && (r.descriptor.addr == descriptor.addr
+                    || r.descriptor.link_key == descriptor.link_key
+                    || r.descriptor.onion_key == descriptor.onion_key)
+        }) {
+            let other = other.descriptor.nickname.clone();
+            drop(relays);
+            self.counters
+                .duplicates_refused
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(relay = %descriptor.nickname, %other, "refused relay reusing another relay's address or keys");
+            return error(
+                DirErrorCode::Conflict,
+                format!(
+                    "{} uses the address or keys of {other}",
+                    descriptor.nickname
+                ),
+            );
+        }
+        if let Some(max) = self.config.network.relay_policy.max_relays_per_ip {
+            let at_ip = relays
+                .values()
+                .filter(|r| {
+                    r.descriptor.node_id != id && r.descriptor.addr.ip() == descriptor.addr.ip()
+                })
+                .count();
+            if at_ip >= max {
+                drop(relays);
+                self.counters
+                    .address_limit_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(relay = %descriptor.nickname, ip = %descriptor.addr.ip(), max, "refused relay: too many relays at this address");
+                return error(
+                    DirErrorCode::ResourceLimit,
+                    format!(
+                        "{} already runs {max} relay(s) (network.toml max_relays_per_ip)",
+                        descriptor.addr.ip()
+                    ),
+                );
+            }
+        }
         let new_keys = match relays.get_mut(&id) {
             Some(entry) if entry.descriptor.published > descriptor.published => {
                 return error(
@@ -579,6 +662,7 @@ impl Inner {
                 entry.running = true;
                 if !was_running {
                     info!(relay = %descriptor.nickname, "relay reachable; listed in the consensus");
+                    self.remember_listing(id);
                 }
             }
             Err(e) => {
@@ -612,17 +696,44 @@ impl Inner {
         }
     }
 
+    /// Note the first time `id` was listed (kept across restarts when a
+    /// state file is configured). Later listings keep the original time.
+    fn remember_listing(&self, id: NodeId) {
+        let mut listed = self.listed_since.lock().unwrap();
+        if listed.contains_key(&id) {
+            return;
+        }
+        listed.insert(id, now_secs());
+        if let Some(path) = &self.config.state_file
+            && let Err(e) = save_listing_history(path, &listed)
+        {
+            warn!(error = %e, path = %path.display(), "could not save the relay listing history");
+        }
+    }
+
     fn sign_consensus(&self) {
-        let mut relays: Vec<RelayDescriptor> = self
-            .relays
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|r| r.running)
-            .map(|r| r.descriptor.clone())
-            .collect();
-        relays.sort_by(|a, b| a.nickname.cmp(&b.nickname));
         let now = now_secs();
+        let mut relays: Vec<RelayDescriptor> = {
+            let relays = self.relays.lock().unwrap();
+            let listed = self.listed_since.lock().unwrap();
+            relays
+                .values()
+                .filter(|r| r.running)
+                .map(|r| {
+                    // Authority-assigned facts, covered by our signature.
+                    let mut d = r.descriptor.clone();
+                    d.operator = self
+                        .config
+                        .approved
+                        .by_nickname(&d.nickname)
+                        .map(|a| a.operator.clone())
+                        .unwrap_or_default();
+                    d.listed_since = listed.get(&d.node_id).copied().unwrap_or(now);
+                    d
+                })
+                .collect()
+        };
+        relays.sort_by(|a, b| a.nickname.cmp(&b.nickname));
         let previous = self.consensus.read().unwrap().as_ref().map(|(_, s, _)| *s);
         let sequence = previous
             .map(|p| p + 1)
@@ -649,6 +760,8 @@ impl Inner {
 
     fn status(&self) -> AuthorityStatus {
         let relays = self.relays.lock().unwrap();
+        let listed = self.listed_since.lock().unwrap();
+        let now = now_secs();
         let mut list: Vec<RelayStatus> = relays
             .values()
             .map(|r| RelayStatus {
@@ -656,6 +769,15 @@ impl Inner {
                 role: r.descriptor.role,
                 address: r.descriptor.addr,
                 family: r.descriptor.family.clone(),
+                operator: self
+                    .config
+                    .approved
+                    .by_nickname(&r.descriptor.nickname)
+                    .map(|a| a.operator.clone())
+                    .unwrap_or_default(),
+                listed_for_secs: listed
+                    .get(&r.descriptor.node_id)
+                    .map(|since| now.saturating_sub(*since)),
                 running: r.running,
                 consecutive_probe_failures: r.failures,
                 seconds_since_upload: r.uploaded.elapsed().as_secs(),
@@ -677,6 +799,42 @@ impl Inner {
             unapproved_uploads: self.counters.unapproved_uploads.load(Ordering::Relaxed),
         }
     }
+}
+
+/// `{ "<identity hex>": first_listed_unix_secs, ... }`
+fn load_listing_history(path: &std::path::Path) -> Result<HashMap<NodeId, u64>, NetError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let raw: HashMap<String, u64> = serde_json::from_str(&text).map_err(|e| {
+        NetError::InvalidConfig(format!("{}: invalid listing history: {e}", path.display()))
+    })?;
+    let mut history = HashMap::new();
+    for (hex, since) in raw {
+        let id = crate::identity::from_hex::<32>(&hex).ok_or_else(|| {
+            NetError::InvalidConfig(format!("{}: invalid identity {hex}", path.display()))
+        })?;
+        history.insert(NodeId::from_bytes(id), since);
+    }
+    Ok(history)
+}
+
+fn save_listing_history(
+    path: &std::path::Path,
+    history: &HashMap<NodeId, u64>,
+) -> std::io::Result<()> {
+    let raw: std::collections::BTreeMap<String, u64> = history
+        .iter()
+        .map(|(id, since)| (id.to_string(), *since))
+        .collect();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&raw).expect("serializes"),
+    )?;
+    std::fs::rename(tmp, path)
 }
 
 /// One connection counted against its IP address; released on drop.
@@ -721,4 +879,26 @@ fn store_error(kind: StoreError, detail: String) -> DirResponse {
         StoreError::Full => DirErrorCode::ResourceLimit,
     };
     error(code, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_history_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("listing-history.json");
+        assert!(
+            load_listing_history(&path).unwrap().is_empty(),
+            "no file yet"
+        );
+        let a = crate::crypto::keys::RelayKeys::generate().node_id();
+        let b = crate::crypto::keys::RelayKeys::generate().node_id();
+        let history = HashMap::from([(a, 1_700_000_000), (b, 1_800_000_000)]);
+        save_listing_history(&path, &history).unwrap();
+        assert_eq!(load_listing_history(&path).unwrap(), history);
+        std::fs::write(&path, "{ \"not hex\": 1 }").unwrap();
+        assert!(load_listing_history(&path).is_err());
+    }
 }

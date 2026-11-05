@@ -108,6 +108,9 @@ async fn run(path: PathBuf) -> Result<(), String> {
     config.consensus_interval = Duration::from_secs(file.consensus_interval_secs);
     config.consensus_lifetime = Duration::from_secs(file.consensus_lifetime_secs);
     config.probe_interval = Duration::from_secs(file.probe_interval_secs);
+    // Remembers when each relay was first listed (guard selection prefers
+    // long-listed entry relays).
+    config.state_file = Some(file.data_dir.join("listing-history.json"));
     let authority = Authority::bind(config, keys)
         .await
         .map_err(|e| e.to_string())?;
@@ -165,20 +168,36 @@ async fn status(network: PathBuf) -> Result<(), String> {
                     s.identity_changes_refused, s.unapproved_uploads
                 );
                 println!(
-                    "  {:<14} {:<10} {:<22} {:<10} {:<8} {:>8} {:>10}",
-                    "relay", "role", "address", "family", "running", "failures", "probe age"
+                    "  {:<14} {:<10} {:<22} {:<10} {:<10} {:<8} {:>8} {:>10} {:>10}",
+                    "relay",
+                    "role",
+                    "address",
+                    "family",
+                    "operator",
+                    "running",
+                    "failures",
+                    "probe age",
+                    "listed"
                 );
                 for r in &s.relays {
                     println!(
-                        "  {:<14} {:<10} {:<22} {:<10} {:<8} {:>8} {:>10}",
+                        "  {:<14} {:<10} {:<22} {:<10} {:<10} {:<8} {:>8} {:>10} {:>10}",
                         r.nickname,
                         r.role.to_string(),
                         r.address.to_string(),
                         r.family,
+                        if r.operator.is_empty() {
+                            "-"
+                        } else {
+                            &r.operator
+                        },
                         if r.running { "yes" } else { "NO" },
                         r.consecutive_probe_failures,
                         r.seconds_since_probe
                             .map(|s| format!("{s} s"))
+                            .unwrap_or_else(|| "-".into()),
+                        r.listed_for_secs
+                            .map(|s| format!("{} min", s / 60))
                             .unwrap_or_else(|| "-".into())
                     );
                 }
