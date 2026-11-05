@@ -1,6 +1,8 @@
 # MASK — Multi-hop Anonymous Service Kit
 
 An experimental privacy browser and onion-routing network, written in Rust.
+This is vibecoded, it is an experiment I am doing to see how well AI can replicate its own
+version of tor.
 
 > **Status: v0.6 development build. MASK is not anonymous and has not been
 > security reviewed.** Normal websites are loaded directly over your internet
