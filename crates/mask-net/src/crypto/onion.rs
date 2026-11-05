@@ -15,7 +15,15 @@
 //! - reordering and deletion detection (later cells fail to verify).
 //!
 //! Any verification failure is fatal for the circuit, because the counters
-//! can no longer be trusted to be in step.
+//! can no longer be trusted to be in step. The cipher enforces this itself
+//! (v0.7): after one failed `open` it refuses every later cell, so no caller
+//! can keep using a circuit whose counters may be out of step.
+//!
+//! **Misuse resistance (v0.7).** A `CellCipher` is either a sealer or an
+//! opener, fixed by its first use. Sealing with an opening cipher (or the
+//! reverse) is refused with [`CryptoError::CipherMisuse`]; this rules out a
+//! programming error that would encrypt two different messages under the
+//! same key and nonce, which would break ChaCha20-Poly1305 completely.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -44,11 +52,22 @@ impl Direction {
     }
 }
 
+/// What a cipher has been used for so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Use {
+    Unused,
+    Sealing,
+    Opening,
+}
+
 /// One direction of one hop: either the sealing or the opening side.
 pub struct CellCipher {
     aead: ChaCha20Poly1305,
     direction: Direction,
     counter: u64,
+    used_for: Use,
+    /// Set by the first failed `open`; the cipher is unusable afterwards.
+    failed: bool,
 }
 
 impl CellCipher {
@@ -57,6 +76,8 @@ impl CellCipher {
             aead: ChaCha20Poly1305::new(&Key::from(*key)),
             direction,
             counter: 0,
+            used_for: Use::Unused,
+            failed: false,
         }
     }
 
@@ -65,7 +86,25 @@ impl CellCipher {
         self.counter
     }
 
+    /// True once a cell failed to open; every later `open` is refused.
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Fix the cipher's job on first use; refuse the other job afterwards.
+    fn claim(&mut self, job: Use) -> Result<(), CryptoError> {
+        match self.used_for {
+            Use::Unused => {
+                self.used_for = job;
+                Ok(())
+            }
+            current if current == job => Ok(()),
+            _ => Err(CryptoError::CipherMisuse),
+        }
+    }
+
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.claim(Use::Sealing)?;
         let nonce = self.nonce()?;
         let ciphertext = self
             .aead
@@ -81,20 +120,30 @@ impl CellCipher {
         Ok(ciphertext)
     }
 
+    /// Open the next cell. A failure poisons the cipher: the counters can no
+    /// longer be trusted, so every later call fails too.
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.claim(Use::Opening)?;
+        if self.failed {
+            return Err(CryptoError::CipherMisuse);
+        }
         let nonce = self.nonce()?;
-        let plaintext = self
-            .aead
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad: &self.aad(),
-                },
-            )
-            .map_err(|_| CryptoError::AuthenticationFailed)?;
-        self.counter += 1;
-        Ok(plaintext)
+        match self.aead.decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &self.aad(),
+            },
+        ) {
+            Ok(plaintext) => {
+                self.counter += 1;
+                Ok(plaintext)
+            }
+            Err(_) => {
+                self.failed = true;
+                Err(CryptoError::AuthenticationFailed)
+            }
+        }
     }
 
     fn nonce(&self) -> Result<Nonce, CryptoError> {
@@ -183,12 +232,42 @@ mod tests {
     }
 
     #[test]
-    fn failed_open_does_not_advance_counter() {
+    fn failed_open_poisons_the_cipher() {
+        // Regression (v0.7): a failed cell used to leave the cipher usable,
+        // so a caller that ignored the error could keep reading the circuit.
         let (mut tx, mut rx) = pair([6; 32]);
         let ct = tx.seal(b"ok").unwrap();
-        assert!(rx.open(b"garbage garbage garbage").is_err());
+        assert_eq!(
+            rx.open(b"garbage garbage garbage"),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        assert!(rx.is_failed());
         assert_eq!(rx.counter(), 0);
-        assert_eq!(rx.open(&ct).unwrap(), b"ok");
+        // Even the genuine next cell is refused now.
+        assert_eq!(rx.open(&ct), Err(CryptoError::CipherMisuse));
+    }
+
+    #[test]
+    fn a_cipher_cannot_both_seal_and_open() {
+        // Using one cipher for both jobs would reuse (key, nonce) pairs.
+        let mut sealer = CellCipher::new(&[10; 32], Direction::Forward);
+        let ct = sealer.seal(b"x").unwrap();
+        assert_eq!(sealer.open(&ct), Err(CryptoError::CipherMisuse));
+        let mut opener = CellCipher::new(&[10; 32], Direction::Forward);
+        opener.open(&ct).unwrap();
+        assert_eq!(opener.seal(b"y"), Err(CryptoError::CipherMisuse));
+    }
+
+    #[test]
+    fn nonces_never_repeat_across_directions_or_counters() {
+        let mut seen = std::collections::HashSet::new();
+        for direction in [Direction::Forward, Direction::Backward] {
+            let mut c = CellCipher::new(&[11; 32], direction);
+            for _ in 0..1000 {
+                assert!(seen.insert(c.nonce().unwrap().to_vec()));
+                c.seal(b"").unwrap();
+            }
+        }
     }
 
     #[test]

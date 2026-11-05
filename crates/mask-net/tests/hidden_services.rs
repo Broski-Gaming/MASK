@@ -12,6 +12,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -167,17 +168,26 @@ impl Net {
     }
 
     fn client(&self) -> MorpClient {
+        self.client_with(|_| {})
+    }
+
+    fn client_with(&self, adjust: impl FnOnce(&mut ClientConfig)) -> MorpClient {
         let mut config = ClientConfig::new(self.relay_dir.clone());
         config.timeouts = timeouts();
         config.policy = self.policy();
         config.connect_timeout = Duration::from_secs(15);
         config.rendezvous_timeout = Duration::from_secs(8);
         config.request_timeout = Duration::from_secs(10);
+        adjust(&mut config);
         MorpClient::new(self.directory(), config)
     }
 
     /// Start a hidden service for a test site and publish its descriptor.
     async fn host(&self, intro_points: usize) -> Hosted {
+        self.host_with(intro_points, |_| {}).await
+    }
+
+    async fn host_with(&self, intro_points: usize, adjust: impl FnOnce(&mut HostConfig)) -> Hosted {
         let site_dir = tempfile::tempdir().unwrap();
         let root = site_dir.path();
         fs::write(
@@ -205,6 +215,7 @@ impl Net {
         config.intro_points = intro_points;
         config.timeouts = timeouts();
         config.policy = self.policy();
+        adjust(&mut config);
         let service = HiddenService::start(identity, config).await.unwrap();
         self.directory()
             .publish(&service.descriptor(now_secs(), DEFAULT_LIFETIME, now_millis()))
@@ -938,4 +949,69 @@ async fn directory_accepts_only_genuine_fresh_descriptors() {
     assert!(
         DirectoryClient::new("192.0.2.1:7200".parse().unwrap(), Duration::from_secs(1)).is_err()
     );
+}
+
+// ====================================================== v0.7 hardening
+
+#[tokio::test]
+async fn intro_point_rotates_to_fresh_keys_after_its_limit() {
+    // Regression (v0.7): one service-wide replay cache used to fill up and
+    // then refuse every introduction until restart. Now each intro point
+    // keeps its own cache and is replaced when it reaches its limit.
+    let net = Net::start(2).await;
+    let hosted = net
+        .host_with(1, |c| c.max_introductions_per_intro = 2)
+        .await;
+    let address = hosted.address();
+    let old_auth = hosted.service.intro_points()[0].auth_key;
+    for _ in 0..2 {
+        net.client().connect(&address).await.unwrap();
+    }
+    let stats = hosted.service.stats();
+    eventually("the intro point is retired", || {
+        stats.intro_points_rotated.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(hosted.service.live_intro_points(), 0);
+
+    // What `mask-service host` does next: replace it and republish.
+    assert_eq!(hosted.service.replenish().await.unwrap(), 1);
+    let new_auth = hosted.service.intro_points()[0].auth_key;
+    assert_ne!(new_auth, old_auth, "fresh intro keys");
+    net.directory()
+        .publish(
+            &hosted
+                .service
+                .descriptor(now_secs(), DEFAULT_LIFETIME, now_millis()),
+        )
+        .await
+        .unwrap();
+    let (session, _) = net.client().connect(&address).await.unwrap();
+    let page = session
+        .request(get("/"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(page.status, 200);
+    assert_eq!(stats.sessions_started.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn service_limits_how_fast_it_accepts_introductions() {
+    let net = Net::start(2).await;
+    let hosted = net
+        .host_with(1, |c| {
+            c.introduction_rate = mask_net::limits::Rate::new(0.0001, 1);
+        })
+        .await;
+    let address = hosted.address();
+    net.client().connect(&address).await.unwrap();
+    let quick = net.client_with(|c| c.rendezvous_timeout = Duration::from_secs(2));
+    match quick.connect(&address).await {
+        Err(FetchError::ServiceUnavailable(_)) => {}
+        Err(other) => panic!("expected the service to ignore the introduction, got {other}"),
+        Ok(_) => panic!("the second introduction should have been dropped"),
+    }
+    let stats = hosted.service.stats();
+    assert_eq!(stats.introductions_rate_limited.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.sessions_started.load(Ordering::Relaxed), 1);
 }

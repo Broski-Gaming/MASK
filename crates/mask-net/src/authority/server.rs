@@ -58,6 +58,9 @@ pub struct AuthorityConfig {
     pub timeouts: Timeouts,
     pub policy: ConnectPolicy,
     pub max_connections: usize,
+    /// Connections open at once from one IP address (v0.7), so one
+    /// machine cannot take every connection slot.
+    pub max_connections_per_ip: usize,
 }
 
 impl AuthorityConfig {
@@ -79,6 +82,7 @@ impl AuthorityConfig {
             timeouts: Timeouts::default(),
             policy: ConnectPolicy::allow_all(),
             max_connections: 256,
+            max_connections_per_ip: 32,
         }
     }
 }
@@ -122,6 +126,7 @@ struct Inner {
     consensus: RwLock<Option<(Vec<u8>, u64, u64)>>,
     changed: Notify,
     connections: Arc<Semaphore>,
+    connections_per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
     counters: Counters,
     shutdown: CancellationToken,
     tasks: TaskTracker,
@@ -171,6 +176,7 @@ impl Authority {
                 consensus: RwLock::new(None),
                 changed: Notify::new(),
                 connections: Arc::new(Semaphore::new(config.max_connections)),
+                connections_per_ip: Mutex::new(HashMap::new()),
                 counters: Counters::default(),
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -225,12 +231,17 @@ impl Authority {
                     warn!(%peer, "refused connection: too many connections");
                     continue;
                 };
+                let Some(slot) = IpSlot::take(&inner, peer.ip()) else {
+                    warn!(%peer, "refused connection: too many connections from this address");
+                    continue;
+                };
                 let this = Arc::clone(&inner);
                 inner.tasks.spawn(
                     async move {
                         if let Err(e) = this.serve_connection(stream).await {
                             debug!(%peer, error = %e, "directory connection ended");
                         }
+                        drop(slot);
                         drop(permit);
                     }
                     .in_current_span(),
@@ -664,6 +675,39 @@ impl Inner {
                 .identity_changes_refused
                 .load(Ordering::Relaxed),
             unapproved_uploads: self.counters.unapproved_uploads.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One connection counted against its IP address; released on drop.
+struct IpSlot {
+    inner: Arc<Inner>,
+    ip: std::net::IpAddr,
+}
+
+impl IpSlot {
+    fn take(inner: &Arc<Inner>, ip: std::net::IpAddr) -> Option<Self> {
+        let mut per_ip = inner.connections_per_ip.lock().unwrap();
+        let count = per_ip.entry(ip).or_insert(0);
+        if *count >= inner.config.max_connections_per_ip {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            inner: Arc::clone(inner),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut per_ip = self.inner.connections_per_ip.lock().unwrap();
+        if let Some(count) = per_ip.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                per_ip.remove(&self.ip);
+            }
         }
     }
 }

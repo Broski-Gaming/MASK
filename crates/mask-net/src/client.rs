@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::timeout;
 
 use crate::crypto::ntor::ClientHandshake;
@@ -26,13 +27,33 @@ use crate::error::NetError;
 use crate::identity::{NodeId, Role};
 use crate::protocol::{
     CircId, DestroyReason, ErrorCode, LayerBody, LinkMsg, MAX_DATA_LEN, RelayCmd, decode, encode,
+    sanitize_remote_text,
 };
 use crate::transport::{
     ConnectPolicy, Connection, Link, LinkKind, LinkReader, Timeouts, WeakLink, handshake_outbound,
 };
 use crate::trust::{DEFAULT_PENALTY, TrustedRelays};
 
-type Routes = Arc<Mutex<HashMap<CircId, mpsc::Sender<LinkMsg>>>>;
+/// Circuit ID → the circuit's receive queue. `None` keeps the ID reserved
+/// after the link gave up on the circuit (its queue stayed full) until the
+/// [`Circuit`] itself is dropped, so the ID cannot be reused under it.
+type Routes = Arc<Mutex<HashMap<CircId, Option<mpsc::Sender<LinkMsg>>>>>;
+
+/// Messages queued per circuit before the link reader waits for its owner.
+const CIRCUIT_QUEUE: usize = 64;
+/// How long the link reader waits for a circuit whose queue is full before
+/// destroying that circuit. Bounds how long one stuck or flooded circuit can
+/// hold up every other circuit on the same link.
+const QUEUE_STALL: Duration = Duration::from_secs(2);
+
+/// [`NetError::Remote`] with the remote's text made safe to show.
+fn remote_error(hop: usize, code: ErrorCode, detail: &str) -> NetError {
+    NetError::Remote {
+        hop,
+        code,
+        detail: sanitize_remote_text(detail),
+    }
+}
 
 /// An open link from this client to one entry relay.
 #[derive(Clone)]
@@ -104,7 +125,7 @@ impl ClientLink {
 
     /// An empty circuit (no hops yet). Exposed for tests of partial circuits.
     pub fn new_circuit(&self) -> Circuit {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(CIRCUIT_QUEUE);
         let circ = {
             let mut routes = self.routes.lock().unwrap();
             let id = loop {
@@ -113,7 +134,7 @@ impl ClientLink {
                     break id;
                 }
             };
-            routes.insert(id, tx);
+            routes.insert(id, Some(tx));
             id
         };
         Circuit {
@@ -124,6 +145,7 @@ impl ClientLink {
             routes: Arc::clone(&self.routes),
             timeouts: self.timeouts,
             destroyed: false,
+            dead: None,
         }
     }
 
@@ -173,9 +195,28 @@ async fn dispatch(mut reader: LinkReader, link: WeakLink, routes: Routes, keepal
             LinkMsg::Pong { .. } => continue,
             _ => break,
         };
-        let tx = routes.lock().unwrap().get(&circ).cloned();
-        if let Some(tx) = tx {
-            let _ = tx.send(msg).await;
+        let tx = routes.lock().unwrap().get(&circ).cloned().flatten();
+        let Some(tx) = tx else { continue };
+        let stuck = match tx.try_send(msg) {
+            Ok(()) | Err(TrySendError::Closed(_)) => false,
+            // Wait a little for the circuit's owner, but never indefinitely:
+            // every other circuit on this link waits meanwhile.
+            Err(TrySendError::Full(msg)) => timeout(QUEUE_STALL, tx.send(msg)).await.is_err(),
+        };
+        if stuck {
+            tracing::warn!(
+                circ,
+                "circuit receive queue stayed full; destroying the circuit"
+            );
+            if let Some(slot) = routes.lock().unwrap().get_mut(&circ) {
+                *slot = None; // the owner sees "closed" once it drains its queue
+            }
+            if let Some(link) = link.upgrade() {
+                link.try_send(LinkMsg::Destroy {
+                    circ,
+                    reason: DestroyReason::ResourceLimit,
+                });
+            }
         }
     }
     // Link gone: dropping the senders wakes every circuit with "closed".
@@ -189,6 +230,13 @@ struct ClientHop {
 }
 
 /// A circuit through one or more relays.
+///
+/// **Failure is final (v0.7).** Any cell that fails to decrypt or decode,
+/// any message that does not belong at this point of the protocol, and any
+/// command from the wrong hop destroys the circuit: a `Destroy` goes to the
+/// entry and every later call fails with [`NetError::Destroyed`]. Only
+/// timeouts and `Error` commands (a hop reporting a failed command, which
+/// is authenticated by that hop's layer) leave the circuit usable.
 pub struct Circuit {
     link: Link,
     circ: CircId,
@@ -196,7 +244,11 @@ pub struct Circuit {
     rx: mpsc::Receiver<LinkMsg>,
     routes: Routes,
     timeouts: Timeouts,
+    /// The entry already knows the circuit is gone (it sent or we sent
+    /// `Destroy`), so dropping the circuit sends nothing.
     destroyed: bool,
+    /// Why the circuit can no longer be used.
+    dead: Option<DestroyReason>,
 }
 
 impl Circuit {
@@ -208,8 +260,45 @@ impl Circuit {
         self.hops.iter().map(|h| &h.descriptor)
     }
 
+    /// True once the circuit has been destroyed (by either side).
+    pub fn is_dead(&self) -> bool {
+        self.dead.is_some()
+    }
+
+    /// Destroy the circuit because of `error` and return the error.
+    fn kill(&mut self, reason: DestroyReason, error: NetError) -> NetError {
+        if self.dead.is_none() {
+            self.dead = Some(reason);
+            if !self.destroyed {
+                self.destroyed = true;
+                self.link.try_send(LinkMsg::Destroy {
+                    circ: self.circ,
+                    reason,
+                });
+            }
+            tracing::debug!(circ = self.circ, ?reason, error = %error, "circuit destroyed by the client");
+        }
+        error
+    }
+
+    fn check_alive(&self) -> Result<(), NetError> {
+        match self.dead {
+            Some(reason) => Err(NetError::Destroyed(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// The peer broke the protocol: destroy the circuit.
+    fn violation(&mut self, what: impl Into<String>) -> NetError {
+        self.kill(
+            DestroyReason::ProtocolViolation,
+            NetError::Protocol(what.into()),
+        )
+    }
+
     /// First hop: CREATE directly on the link.
     pub async fn create(&mut self, relay: &RelayDescriptor) -> Result<(), NetError> {
+        self.check_alive()?;
         if !self.hops.is_empty() {
             return Err(NetError::InvalidConfig("circuit already created".into()));
         }
@@ -221,16 +310,20 @@ impl Circuit {
             })
             .await?;
         match self.recv_msg(self.timeouts.handshake).await? {
-            LinkMsg::Created { reply, .. } => {
-                let keys = handshake.finish(&reply)?;
-                self.push_hop(relay, &keys.forward, &keys.backward);
-                Ok(())
-            }
+            LinkMsg::Created { reply, .. } => match handshake.finish(&reply) {
+                Ok(keys) => {
+                    self.push_hop(relay, &keys.forward, &keys.backward);
+                    Ok(())
+                }
+                // Not the relay we asked for (impostor or stale key).
+                Err(e) => Err(self.kill(DestroyReason::WrongRelay, e.into())),
+            },
             LinkMsg::Destroy { reason, .. } => {
                 self.destroyed = true;
+                self.dead = Some(reason);
                 Err(NetError::Destroyed(reason))
             }
-            _ => Err(NetError::Protocol("expected CREATED".into())),
+            other => Err(self.violation(format!("expected CREATED, got {}", other.kind()))),
         }
     }
 
@@ -249,13 +342,19 @@ impl Circuit {
         )
         .await?;
         match self.recv_cmd(self.timeouts.handshake * 2).await? {
-            (hop, RelayCmd::Extended { reply }) if hop == last => {
-                let keys = handshake.finish(&reply)?;
-                self.push_hop(relay, &keys.forward, &keys.backward);
-                Ok(())
-            }
-            (hop, RelayCmd::Error { code, detail }) => Err(NetError::Remote { hop, code, detail }),
-            _ => Err(NetError::Protocol("expected EXTENDED".into())),
+            (hop, RelayCmd::Extended { reply }) if hop == last => match handshake.finish(&reply) {
+                Ok(keys) => {
+                    self.push_hop(relay, &keys.forward, &keys.backward);
+                    Ok(())
+                }
+                Err(e) => Err(self.kill(DestroyReason::WrongRelay, e.into())),
+            },
+            (hop, RelayCmd::Error { code, detail }) => Err(remote_error(hop, code, &detail)),
+            (hop, cmd) => Err(self.violation(format!(
+                "expected EXTENDED, got {} from hop {}",
+                cmd.kind(),
+                hop + 1
+            ))),
         }
     }
 
@@ -279,8 +378,12 @@ impl Circuit {
         .await?;
         match self.recv_cmd(self.timeouts.response).await? {
             (hop, RelayCmd::Data { bytes }) if hop == last => Ok(bytes),
-            (hop, RelayCmd::Error { code, detail }) => Err(NetError::Remote { hop, code, detail }),
-            _ => Err(NetError::Protocol("expected DATA".into())),
+            (hop, RelayCmd::Error { code, detail }) => Err(remote_error(hop, code, &detail)),
+            (hop, cmd) => Err(self.violation(format!(
+                "expected DATA, got {} from hop {}",
+                cmd.kind(),
+                hop + 1
+            ))),
         }
     }
 
@@ -316,11 +419,15 @@ impl Circuit {
         let last = self.last_hop()?;
         let (hop, cmd) = self.recv_cmd_opt(limit).await?;
         match cmd {
-            RelayCmd::Error { code, detail } => Err(NetError::Remote { hop, code, detail }),
+            RelayCmd::Error { code, detail } => Err(remote_error(hop, code, &detail)),
             cmd if hop == last => Ok(cmd),
-            _ => Err(NetError::Protocol(
-                "unexpected command from an intermediate hop".into(),
-            )),
+            // A middle relay must never originate data or hidden-service
+            // replies: only its own errors.
+            cmd => Err(self.violation(format!(
+                "unexpected {} from intermediate hop {}",
+                cmd.kind(),
+                hop + 1
+            ))),
         }
     }
 
@@ -372,7 +479,13 @@ impl Circuit {
     }
 
     async fn send_cmd(&mut self, target: usize, cmd: RelayCmd) -> Result<(), NetError> {
-        let cell = self.seal_for(target, cmd)?;
+        self.check_alive()?;
+        let cell = match self.seal_for(target, cmd) {
+            Ok(cell) => cell,
+            // Some layers may already have advanced their counters: the
+            // circuit is out of step and must not be used again.
+            Err(e) => return Err(self.kill(DestroyReason::ResourceLimit, e)),
+        };
         self.link
             .send(LinkMsg::Relay {
                 circ: self.circ,
@@ -390,6 +503,7 @@ impl Circuit {
         &mut self,
         limit: Option<std::time::Duration>,
     ) -> Result<LinkMsg, NetError> {
+        self.check_alive()?;
         let received = match limit {
             Some(limit) => timeout(limit, self.rx.recv())
                 .await
@@ -412,12 +526,19 @@ impl Circuit {
         limit: Option<std::time::Duration>,
     ) -> Result<(usize, RelayCmd), NetError> {
         match self.recv_msg_opt(limit).await? {
-            LinkMsg::Relay { cell, .. } => self.peel(cell),
+            LinkMsg::Relay { cell, .. } => match self.peel(cell) {
+                Ok(found) => Ok(found),
+                Err(e @ NetError::Crypto(_)) => {
+                    Err(self.kill(DestroyReason::AuthenticationFailed, e))
+                }
+                Err(e) => Err(self.kill(DestroyReason::ProtocolViolation, e)),
+            },
             LinkMsg::Destroy { reason, .. } => {
                 self.destroyed = true;
+                self.dead = Some(reason);
                 Err(NetError::Destroyed(reason))
             }
-            _ => Err(NetError::Protocol("unexpected message on circuit".into())),
+            other => Err(self.violation(format!("unexpected {} on circuit", other.kind()))),
         }
     }
 

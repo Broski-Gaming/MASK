@@ -61,6 +61,28 @@ fn check_label(
     Ok(())
 }
 
+/// A `(per_sec, burst)` pair from a config file: both or neither, finite,
+/// per_sec > 0, burst >= 1.
+fn rate(
+    path: &Path,
+    name: &str,
+    per_sec: Option<f64>,
+    burst: Option<u32>,
+) -> Result<Option<crate::limits::Rate>, NetError> {
+    match (per_sec, burst) {
+        (None, None) => Ok(None),
+        (Some(per_sec), Some(burst)) if per_sec.is_finite() && per_sec > 0.0 && burst >= 1 => {
+            Ok(Some(crate::limits::Rate::new(per_sec, burst)))
+        }
+        _ => Err(invalid(
+            path,
+            format!(
+                "{name} needs a positive rate and a burst of at least 1 (set both {name} and its burst)"
+            ),
+        )),
+    }
+}
+
 // ------------------------------------------------------------ network.toml
 
 #[derive(Deserialize)]
@@ -173,6 +195,10 @@ struct LimitsFile {
     max_links_per_ip: Option<usize>,
     max_circuits: Option<usize>,
     max_circuits_per_link: Option<usize>,
+    create_rate_per_ip: Option<f64>,
+    create_burst_per_ip: Option<u32>,
+    intro_rate: Option<f64>,
+    intro_burst: Option<u32>,
 }
 
 /// Parsed `relay.toml`.
@@ -195,6 +221,10 @@ pub struct RelayFileConfig {
     pub max_links_per_ip: Option<usize>,
     pub max_circuits: Option<usize>,
     pub max_circuits_per_link: Option<usize>,
+    /// CREATEs per second per client IP and burst (entry relays).
+    pub create_rate_per_ip: Option<crate::limits::Rate>,
+    /// Introductions per second per introduction point and burst.
+    pub intro_rate: Option<crate::limits::Rate>,
 }
 
 impl RelayFileConfig {
@@ -252,6 +282,18 @@ impl RelayFileConfig {
             max_links_per_ip: file.limits.max_links_per_ip,
             max_circuits: file.limits.max_circuits,
             max_circuits_per_link: file.limits.max_circuits_per_link,
+            create_rate_per_ip: rate(
+                path,
+                "create_rate_per_ip",
+                file.limits.create_rate_per_ip,
+                file.limits.create_burst_per_ip,
+            )?,
+            intro_rate: rate(
+                path,
+                "intro_rate",
+                file.limits.intro_rate,
+                file.limits.intro_burst,
+            )?,
         })
     }
 }

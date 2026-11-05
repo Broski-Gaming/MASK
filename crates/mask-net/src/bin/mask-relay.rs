@@ -184,6 +184,12 @@ async fn run_network(args: &Args, path: PathBuf) -> Result<(), String> {
     if let Some(n) = file.max_circuits_per_link {
         config.limits.circuits_per_link = n;
     }
+    if let Some(rate) = file.create_rate_per_ip {
+        config.limits.create_rate_per_ip = rate;
+    }
+    if let Some(rate) = file.intro_rate {
+        config.limits.intro_rate = rate;
+    }
     let relay = Relay::bind(config, keys)
         .await
         .map_err(|e| format!("could not start relay on {}: {e}", file.listen))?;

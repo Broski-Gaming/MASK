@@ -35,6 +35,7 @@ pub mod directory;
 pub mod error;
 pub mod hs;
 pub mod identity;
+pub mod limits;
 pub mod protocol;
 pub mod relay;
 pub mod scope;

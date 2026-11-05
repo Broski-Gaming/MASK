@@ -34,6 +34,9 @@ pub enum CryptoError {
     /// A per-hop nonce counter would wrap; the circuit must be rebuilt.
     NonceExhausted,
     BadSignature,
+    /// A cipher was used for the wrong job (opening with a sealing key or
+    /// the reverse), or used again after it failed. Never reaches the wire.
+    CipherMisuse,
 }
 
 impl fmt::Display for CryptoError {
@@ -44,6 +47,7 @@ impl fmt::Display for CryptoError {
             Self::WrongRelay => "handshake addressed to a different relay key",
             Self::NonceExhausted => "nonce counter exhausted",
             Self::BadSignature => "invalid signature",
+            Self::CipherMisuse => "cipher used for the wrong direction or after a failure",
         })
     }
 }

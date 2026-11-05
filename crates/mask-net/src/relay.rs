@@ -54,6 +54,7 @@ use crate::crypto::onion::{CellCipher, Direction};
 use crate::descriptor::RelayDescriptor;
 use crate::error::NetError;
 use crate::identity::{NodeId, Role};
+use crate::limits::{KeyedBuckets, Rate, TokenBucket};
 use crate::protocol::{
     CircId, DestroyReason, ErrorCode, LayerBody, LinkErrorCode, LinkMsg, RelayCmd, decode, encode,
 };
@@ -81,6 +82,13 @@ pub struct Limits {
     pub max_links: usize,
     /// Inbound links open at once from one IP address.
     pub max_links_per_ip: usize,
+    /// Circuit creations (CREATE on client links, entry relays only) per
+    /// client IP address. Each costs this relay a handshake. Relay → relay
+    /// links carry many clients' circuits and are not limited this way.
+    pub create_rate_per_ip: Rate,
+    /// `Introduce1` cells per introduction point (rendezvous role): bounds
+    /// how fast anyone can make a hidden service build rendezvous circuits.
+    pub intro_rate: Rate,
 }
 
 impl Default for Limits {
@@ -93,9 +101,14 @@ impl Default for Limits {
             rendezvous_timeout: Duration::from_secs(60),
             max_links: 2048,
             max_links_per_ip: 256,
+            create_rate_per_ip: Rate::new(16.0, 256),
+            intro_rate: Rate::new(8.0, 64),
         }
     }
 }
+
+/// Client IP addresses tracked by the CREATE rate limiter.
+const MAX_RATE_LIMITED_IPS: usize = 8192;
 
 /// Test hook: called with every plaintext this relay can decrypt (the
 /// contents of its own onion layer). Used to prove what a relay can and
@@ -187,6 +200,13 @@ pub struct RelayStats {
     pub links_refused: u64,
     /// Outbound links declared dead after unanswered keepalives.
     pub keepalive_failures: u64,
+    /// CREATEs refused by the per-IP rate limit.
+    pub creates_rate_limited: u64,
+    /// `Introduce1` cells refused by the per-intro-point rate limit.
+    pub introductions_rate_limited: u64,
+    /// Circuits destroyed because a neighbour broke the protocol (bad
+    /// cell, wrong state, unexpected message).
+    pub protocol_violations: u64,
 }
 
 #[derive(Default)]
@@ -199,6 +219,9 @@ struct Counters {
     stream_cells: AtomicU64,
     links_refused: AtomicU64,
     keepalive_failures: AtomicU64,
+    creates_rate_limited: AtomicU64,
+    introductions_rate_limited: AtomicU64,
+    protocol_violations: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -225,6 +248,7 @@ struct Inner {
     trusted: TrustedRelays,
     links: Arc<Semaphore>,
     links_per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
+    create_limiter: Mutex<KeyedBuckets<std::net::IpAddr>>,
     tasks: TaskTracker,
 }
 
@@ -239,8 +263,9 @@ struct Table {
 /// Hidden-service state of a rendezvous-role relay.
 #[derive(Default)]
 struct HsTable {
-    /// Intro auth key → the service's intro circuit.
-    intros: HashMap<[u8; 32], Arc<Circuit>>,
+    /// Intro auth key → the service's intro circuit and its introduction
+    /// rate limit.
+    intros: HashMap<[u8; 32], (Arc<Circuit>, TokenBucket)>,
     /// Rendezvous cookie → waiting client circuit and when it registered.
     cookies: HashMap<[u8; 32], (Arc<Circuit>, Instant)>,
 }
@@ -346,6 +371,10 @@ impl Relay {
                 trusted: config.trusted,
                 links: Arc::new(Semaphore::new(config.limits.max_links)),
                 links_per_ip: Mutex::new(HashMap::new()),
+                create_limiter: Mutex::new(KeyedBuckets::new(
+                    config.limits.create_rate_per_ip,
+                    MAX_RATE_LIMITED_IPS,
+                )),
                 tasks: TaskTracker::new(),
                 table: Mutex::new(Table::default()),
                 hs: Mutex::new(HsTable::default()),
@@ -464,6 +493,9 @@ impl RelayHandle {
             open_links: self.inner.limits.max_links - self.inner.links.available_permits(),
             links_refused: c.links_refused.load(Ordering::Relaxed),
             keepalive_failures: c.keepalive_failures.load(Ordering::Relaxed),
+            creates_rate_limited: c.creates_rate_limited.load(Ordering::Relaxed),
+            introductions_rate_limited: c.introductions_rate_limited.load(Ordering::Relaxed),
+            protocol_violations: c.protocol_violations.load(Ordering::Relaxed),
         }
     }
 
@@ -521,7 +553,7 @@ impl Inner {
 
     async fn handle_inbound(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
         debug!(%peer, "inbound connection");
-        match self.serve_inbound(stream).await {
+        match self.serve_inbound(stream, peer).await {
             Ok(()) => info!(%peer, "inbound link closed"),
             Err(e @ (NetError::Untrusted(_) | NetError::Crypto(_))) => {
                 bump(&self.counters.links_refused);
@@ -562,7 +594,11 @@ impl Inner {
         }
     }
 
-    async fn serve_inbound(self: &Arc<Self>, stream: TcpStream) -> Result<(), NetError> {
+    async fn serve_inbound(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), NetError> {
         let mut authenticated = None;
         let accepted = Connection::accept(
             stream,
@@ -589,6 +625,8 @@ impl Inner {
         let peer_role =
             handshake_inbound(&mut conn, self.role, authenticated, self.timeouts.handshake).await?;
         info!(%peer_role, "link handshake complete (Noise authenticated)");
+        // CREATE rate limits apply to client links (keyed by IP address).
+        let client_ip = (accepted.kind == LinkKind::Client).then(|| peer.ip());
         let (link, mut reader) = conn.into_link();
 
         let result = loop {
@@ -618,7 +656,9 @@ impl Inner {
                 Err(e) => break Err(e),
             };
             match msg {
-                LinkMsg::Create { circ, request } => self.on_create(&link, circ, request).await,
+                LinkMsg::Create { circ, request } => {
+                    self.on_create(&link, circ, request, client_ip).await
+                }
                 LinkMsg::Relay { circ, cell } => self.on_forward_cell(&link, circ, cell).await,
                 LinkMsg::Destroy { circ, reason } => {
                     if let Some(circuit) = self.lookup_in(link.id(), circ) {
@@ -630,7 +670,9 @@ impl Inner {
                 }
                 LinkMsg::Pong { .. } => {}
                 other => {
-                    let detail = format!("unexpected {other:?} on inbound link");
+                    // The variant only: never log message contents.
+                    bump(&self.counters.protocol_violations);
+                    let detail = format!("unexpected {} on inbound link", other.kind());
                     let _ = link
                         .send(LinkMsg::LinkError {
                             code: LinkErrorCode::Malformed,
@@ -664,7 +706,13 @@ impl Inner {
         result
     }
 
-    async fn on_create(&self, link: &Link, circ: CircId, request: CreateRequest) {
+    async fn on_create(
+        &self,
+        link: &Link,
+        circ: CircId,
+        request: CreateRequest,
+        client_ip: Option<std::net::IpAddr>,
+    ) {
         let refuse = |reason| LinkMsg::Destroy { circ, reason };
         let admission = {
             let table = self.table.lock().unwrap();
@@ -679,6 +727,14 @@ impl Inner {
                 Ok(())
             }
         };
+        // Checked last so refused CREATEs for other reasons cost no token.
+        let admission = admission.and_then(|()| match client_ip {
+            Some(ip) if !self.create_limiter.lock().unwrap().try_take(&ip) => {
+                bump(&self.counters.creates_rate_limited);
+                Err(DestroyReason::ResourceLimit)
+            }
+            _ => Ok(()),
+        });
         if let Err(reason) = admission {
             warn!(circ, ?reason, "refused CREATE");
             let _ = link.send(refuse(reason)).await;
@@ -735,6 +791,7 @@ impl Inner {
         let plaintext = match opened {
             Ok(p) => p,
             Err(e) => {
+                bump(&self.counters.protocol_violations);
                 warn!(circ, error = %e, "forward cell rejected; destroying circuit");
                 self.teardown(&circuit, DestroyReason::AuthenticationFailed, true, true)
                     .await;
@@ -743,6 +800,7 @@ impl Inner {
         };
         self.observe(&plaintext);
         let Ok(body) = decode::<LayerBody>(&plaintext) else {
+            bump(&self.counters.protocol_violations);
             warn!(circ, "undecodable layer; destroying circuit");
             self.teardown(&circuit, DestroyReason::ProtocolViolation, true, true)
                 .await;
@@ -772,6 +830,7 @@ impl Inner {
                         }
                     }
                     _ => {
+                        bump(&self.counters.protocol_violations);
                         warn!(circ, "cell to relay onward but circuit is not extended");
                         self.teardown(&circuit, DestroyReason::ProtocolViolation, true, true)
                             .await;
@@ -862,7 +921,8 @@ impl Inner {
             | RelayCmd::Introduce2 { .. }
             | RelayCmd::RendezvousEstablished
             | RelayCmd::Rendezvous2 { .. } => {
-                warn!(circ, "creator sent a relay-only command");
+                bump(&self.counters.protocol_violations);
+                warn!(circ, cmd = cmd.kind(), "creator sent a relay-only command");
                 self.teardown(circuit, DestroyReason::ProtocolViolation, true, true)
                     .await;
             }
@@ -903,11 +963,17 @@ impl Inner {
                     } else if hs
                         .intros
                         .get(&auth_key)
-                        .is_some_and(|c| !c.closed.load(Ordering::SeqCst))
+                        .is_some_and(|(c, _)| !c.closed.load(Ordering::SeqCst))
                     {
                         Some((ErrorCode::Rejected, "auth key already registered"))
                     } else {
-                        hs.intros.insert(auth_key, Arc::clone(circuit));
+                        hs.intros.insert(
+                            auth_key,
+                            (
+                                Arc::clone(circuit),
+                                TokenBucket::new(self.limits.intro_rate),
+                            ),
+                        );
                         *circuit.hs.lock().unwrap() = CircHs::Intro(auth_key);
                         None
                     }
@@ -928,22 +994,41 @@ impl Inner {
                         .reply_error(circuit, ErrorCode::Rejected, "invalid introduction")
                         .await;
                 }
-                let service = self
-                    .hs
-                    .lock()
-                    .unwrap()
-                    .intros
-                    .get(&auth_key)
-                    .filter(|c| !c.closed.load(Ordering::SeqCst))
-                    .cloned();
-                let Some(service) = service else {
-                    return self
-                        .reply_error(
-                            circuit,
-                            ErrorCode::UnknownService,
-                            "no service registered for this intro key",
-                        )
-                        .await;
+                let service = {
+                    let mut hs = self.hs.lock().unwrap();
+                    match hs.intros.get_mut(&auth_key) {
+                        Some((c, bucket)) if !c.closed.load(Ordering::SeqCst) => {
+                            if bucket.try_take() {
+                                Ok(Arc::clone(c))
+                            } else {
+                                Err(true)
+                            }
+                        }
+                        _ => Err(false),
+                    }
+                };
+                let service = match service {
+                    Ok(service) => service,
+                    Err(true) => {
+                        bump(&self.counters.introductions_rate_limited);
+                        warn!(circ, "introduction rate limit reached for an intro point");
+                        return self
+                            .reply_error(
+                                circuit,
+                                ErrorCode::ResourceLimit,
+                                "too many introductions for this service; try again later",
+                            )
+                            .await;
+                    }
+                    Err(false) => {
+                        return self
+                            .reply_error(
+                                circuit,
+                                ErrorCode::UnknownService,
+                                "no service registered for this intro key",
+                            )
+                            .await;
+                    }
                 };
                 bump(&self.counters.introductions);
                 info!(circ, "forwarding introduction to service");
@@ -1309,6 +1394,16 @@ impl Inner {
                         debug!(circ = circuit.in_circ, bytes = cell.len(), "returning cell");
                         bump(&self.counters.cells_returned);
                         self.send_backward(&circuit, LayerBody::Relay(cell)).await;
+                    } else {
+                        // A cell before CREATED: the next hop broke the
+                        // protocol (v0.7: used to be dropped silently).
+                        bump(&self.counters.protocol_violations);
+                        warn!(
+                            circ = circuit.in_circ,
+                            "next hop sent a cell on a circuit that is not open"
+                        );
+                        self.teardown(&circuit, DestroyReason::ProtocolViolation, true, true)
+                            .await;
                     }
                 }
                 LinkMsg::Destroy { circ, reason } => {
@@ -1333,8 +1428,10 @@ impl Inner {
                     }
                 }
                 other => {
+                    bump(&self.counters.protocol_violations);
                     break Err(NetError::Protocol(format!(
-                        "unexpected {other:?} on outbound link"
+                        "unexpected {} on outbound link",
+                        other.kind()
                     )));
                 }
             }
@@ -1454,7 +1551,11 @@ impl Inner {
             let mut hs = self.hs.lock().unwrap();
             match hs_state {
                 CircHs::Intro(key) => {
-                    if hs.intros.get(&key).is_some_and(|c| Arc::ptr_eq(c, circuit)) {
+                    if hs
+                        .intros
+                        .get(&key)
+                        .is_some_and(|(c, _)| Arc::ptr_eq(c, circuit))
+                    {
                         hs.intros.remove(&key);
                     }
                     None

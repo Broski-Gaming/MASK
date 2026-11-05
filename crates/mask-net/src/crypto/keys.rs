@@ -74,7 +74,9 @@ impl RelayKeys {
         PublicKey::from(&self.link).to_bytes()
     }
 
-    pub(crate) fn link_secret(&self) -> &StaticSecret {
+    /// The Noise link secret, for accepting links as this relay. Public so
+    /// tests can run scripted hostile relays that speak real MORP.
+    pub fn link_secret(&self) -> &StaticSecret {
         &self.link
     }
 

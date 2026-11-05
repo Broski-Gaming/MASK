@@ -650,8 +650,14 @@ pub async fn handshake_outbound(
                 Ok(role)
             }
         }
-        Some(LinkMsg::LinkError { code, detail }) => Err(NetError::LinkRejected { code, detail }),
-        Some(_) => Err(NetError::Protocol("expected Welcome".into())),
+        Some(LinkMsg::LinkError { code, detail }) => Err(NetError::LinkRejected {
+            code,
+            detail: crate::protocol::sanitize_remote_text(&detail),
+        }),
+        Some(other) => Err(NetError::Protocol(format!(
+            "expected Welcome, got {}",
+            other.kind()
+        ))),
         None => Err(NetError::ConnectionClosed),
     }
 }

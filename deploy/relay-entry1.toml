@@ -14,3 +14,7 @@ max_links = 2048
 max_links_per_ip = 256
 max_circuits = 4096
 max_circuits_per_link = 128
+create_rate_per_ip = 16.0           # circuit creations per second per client IP (entry relays)
+create_burst_per_ip = 256
+intro_rate = 8.0                    # introductions per second per intro point (rendezvous relays)
+intro_burst = 64

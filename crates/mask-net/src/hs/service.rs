@@ -26,20 +26,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::app::AppForwarder;
-use super::crypto::{IntroKeys, accept_introduction, open_introduction};
+use super::crypto::{IntroKeys, Introduction, accept_introduction, open_introduction};
 use super::session::{self, Handler, HttpRequest};
 use crate::NetError;
 use crate::address::MorpAddress;
 use crate::client::{Circuit, build_circuit_to};
 use crate::identity::{NodeId, Role};
+use crate::limits::{Rate, TokenBucket};
 use crate::protocol::RelayCmd;
 use crate::service::descriptor::{IntroPoint, MAX_INTRO_POINTS, ServiceDescriptor};
 use crate::service::keys::ServiceKeys;
 use crate::transport::{ConnectPolicy, Timeouts};
 use crate::trust::TrustedRelays;
-
-/// Remembered client ephemeral keys (replay protection), per service run.
-const MAX_SEEN_INTRODUCTIONS: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -53,6 +51,17 @@ pub struct HostConfig {
     pub max_sessions: usize,
     /// Timeout for each request to the local application.
     pub app_timeout: Duration,
+    /// Introductions accepted through one introduction point before it is
+    /// replaced by a fresh one (new keys, possibly another relay). Each
+    /// intro point remembers the introductions it accepted to reject
+    /// replays; rotating bounds that memory without ever forgetting a
+    /// replay that could still arrive (Tor rotates intro points the same way).
+    pub max_introductions_per_intro: usize,
+    /// Introductions processed, over all intro points. Each costs the
+    /// service a new circuit to a rendezvous point chosen by the client.
+    pub introduction_rate: Rate,
+    /// Rendezvous circuits being built at once.
+    pub max_pending_rendezvous: usize,
 }
 
 impl HostConfig {
@@ -66,6 +75,9 @@ impl HostConfig {
             policy: ConnectPolicy::allow_all(),
             max_sessions: 64,
             app_timeout: Duration::from_secs(30),
+            max_introductions_per_intro: 16_384,
+            introduction_rate: Rate::new(10.0, 64),
+            max_pending_rendezvous: 16,
         }
     }
 }
@@ -82,6 +94,13 @@ pub struct HostStats {
     pub live_intro_points: AtomicUsize,
     /// Introduction points re-established after one was lost.
     pub intro_points_replaced: AtomicU64,
+    /// Introduction points retired after `max_introductions_per_intro`.
+    pub intro_points_rotated: AtomicU64,
+    /// Introductions dropped by the service's introduction rate limit.
+    pub introductions_rate_limited: AtomicU64,
+    /// Introductions dropped because too many rendezvous circuits were
+    /// already being built, or the session limit was reached.
+    pub introductions_dropped: AtomicU64,
 }
 
 struct Ctx {
@@ -89,7 +108,8 @@ struct Ctx {
     config: HostConfig,
     forwarder: Arc<AppForwarder>,
     stats: Arc<HostStats>,
-    seen: Mutex<HashSet<[u8; 32]>>,
+    intro_limiter: Mutex<TokenBucket>,
+    pending_rendezvous: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
     shutdown: CancellationToken,
     /// Live introduction points (what the descriptor should list).
@@ -123,7 +143,8 @@ impl HiddenService {
             identity: Arc::new(identity),
             forwarder,
             stats: Arc::default(),
-            seen: Mutex::new(HashSet::new()),
+            intro_limiter: Mutex::new(TokenBucket::new(config.introduction_rate)),
+            pending_rendezvous: Arc::new(Semaphore::new(config.max_pending_rendezvous.max(1))),
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             shutdown: CancellationToken::new(),
             config,
@@ -313,7 +334,20 @@ async fn establish_intro(
     }
 }
 
+/// Receive introductions on one intro circuit. Introductions are decrypted
+/// and checked for replay here, one at a time; only good ones start a
+/// rendezvous. Each intro point has its own replay cache: once it has
+/// accepted `max_introductions_per_intro` introductions the intro point is
+/// retired (and replaced with fresh keys), so the cache never has to forget
+/// an entry while a replay of it could still be delivered.
+///
+/// Regression (v0.7): there used to be one service-wide cache that, once
+/// full, refused *all* introductions until the service restarted; anyone
+/// could fill it with valid introductions and take the service offline.
 async fn intro_listener(ctx: Arc<Ctx>, mut circuit: Circuit, keys: Arc<IntroKeys>, relay: NodeId) {
+    let address = *ctx.identity.address();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut rotate = false;
     loop {
         let received = tokio::select! {
             received = circuit.recv_from_last(None) => received,
@@ -322,56 +356,78 @@ async fn intro_listener(ctx: Arc<Ctx>, mut circuit: Circuit, keys: Arc<IntroKeys
         match received {
             Ok(RelayCmd::Introduce2 { payload }) => {
                 ctx.stats.introductions.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(handle_introduction(
-                    Arc::clone(&ctx),
-                    Arc::clone(&keys),
-                    payload,
-                ));
+                if !ctx.intro_limiter.lock().unwrap().try_take() {
+                    ctx.stats
+                        .introductions_rate_limited
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!("introduction rate limit reached; dropping an introduction");
+                    continue;
+                }
+                let intro = match open_introduction(&address, &keys, &payload) {
+                    Ok(intro) => intro,
+                    Err(e) => {
+                        ctx.stats.bad_introductions.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %e, "rejected undecryptable introduction");
+                        continue;
+                    }
+                };
+                if !seen.insert(intro.client_ephemeral) {
+                    ctx.stats.replays_rejected.fetch_add(1, Ordering::Relaxed);
+                    warn!("rejected replayed introduction");
+                    continue;
+                }
+                tokio::spawn(handle_introduction(Arc::clone(&ctx), intro));
+                if seen.len() >= ctx.config.max_introductions_per_intro {
+                    info!(
+                        introductions = seen.len(),
+                        "introduction point reached its limit; rotating to fresh keys"
+                    );
+                    rotate = true;
+                    break;
+                }
             }
-            Ok(other) => debug!(?other, "ignoring unexpected command on intro circuit"),
+            Ok(other) => debug!(
+                cmd = other.kind(),
+                "ignoring unexpected command on intro circuit"
+            ),
             Err(e) => {
                 warn!(error = %e, "introduction circuit lost");
                 break;
             }
         }
     }
+    drop(circuit); // destroys the intro registration at the relay
     let auth = keys.auth_public();
     ctx.intros.lock().unwrap().retain(|ip| ip.auth_key != auth);
     ctx.stats.live_intro_points.fetch_sub(1, Ordering::SeqCst);
     if !ctx.shutdown.is_cancelled() {
-        ctx.config
-            .relays
-            .health()
-            .mark_failed(relay, crate::trust::DEFAULT_PENALTY);
+        if rotate {
+            ctx.stats
+                .intro_points_rotated
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            ctx.config
+                .relays
+                .health()
+                .mark_failed(relay, crate::trust::DEFAULT_PENALTY);
+        }
         ctx.intro_lost.notify_one();
     }
 }
 
-async fn handle_introduction(ctx: Arc<Ctx>, keys: Arc<IntroKeys>, payload: Vec<u8>) {
-    let address = *ctx.identity.address();
-    let intro = match open_introduction(&address, &keys, &payload) {
-        Ok(intro) => intro,
-        Err(e) => {
-            ctx.stats.bad_introductions.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "rejected undecryptable introduction");
-            return;
-        }
-    };
-    {
-        let mut seen = ctx.seen.lock().unwrap();
-        if seen.contains(&intro.client_ephemeral) {
-            ctx.stats.replays_rejected.fetch_add(1, Ordering::Relaxed);
-            warn!("rejected replayed introduction");
-            return;
-        }
-        if seen.len() >= MAX_SEEN_INTRODUCTIONS {
-            warn!("replay cache full; refusing introductions until restart");
-            return;
-        }
-        seen.insert(intro.client_ephemeral);
-    }
+async fn handle_introduction(ctx: Arc<Ctx>, intro: Introduction) {
     let Ok(permit) = Arc::clone(&ctx.sessions).try_acquire_owned() else {
+        ctx.stats
+            .introductions_dropped
+            .fetch_add(1, Ordering::Relaxed);
         warn!("session limit reached; ignoring introduction");
+        return;
+    };
+    let Ok(pending) = Arc::clone(&ctx.pending_rendezvous).try_acquire_owned() else {
+        ctx.stats
+            .introductions_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        warn!("too many rendezvous circuits being built; ignoring introduction");
         return;
     };
 
@@ -416,6 +472,7 @@ async fn handle_introduction(ctx: Arc<Ctx>, keys: Arc<IntroKeys>, payload: Vec<u
                 return;
             }
         };
+    drop(pending);
 
     info!(%rendezvous, "rendezvous complete; serving session");
     ctx.stats.sessions_started.fetch_add(1, Ordering::Relaxed);

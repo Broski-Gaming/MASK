@@ -85,7 +85,12 @@ impl AuthorityClient {
             .recv_bytes(self.timeouts.response)
             .await?
             .ok_or(NetError::ConnectionClosed)?;
-        Ok(decode(&reply)?)
+        let mut response: DirResponse = decode(&reply)?;
+        // Free text from the other side is made safe to print and log.
+        if let DirResponse::Ok { detail } | DirResponse::Error { detail, .. } = &mut response {
+            *detail = crate::protocol::sanitize_remote_text(detail);
+        }
+        Ok(response)
     }
 
     /// Authorities in random order, so load spreads across them.

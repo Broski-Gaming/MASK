@@ -188,6 +188,72 @@ pub enum ErrorCode {
     ResourceLimit,
 }
 
+impl LinkMsg {
+    /// The variant name, for logs. Never log a whole message: cells carry
+    /// (encrypted) payloads and error details carry remote-chosen text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "Hello",
+            Self::Welcome { .. } => "Welcome",
+            Self::LinkError { .. } => "LinkError",
+            Self::Create { .. } => "Create",
+            Self::Created { .. } => "Created",
+            Self::Relay { .. } => "Relay",
+            Self::Destroy { .. } => "Destroy",
+            Self::Ping { .. } => "Ping",
+            Self::Pong { .. } => "Pong",
+        }
+    }
+}
+
+impl RelayCmd {
+    /// The variant name, for logs (see [`LinkMsg::kind`]).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Extend { .. } => "Extend",
+            Self::Extended { .. } => "Extended",
+            Self::Data { .. } => "Data",
+            Self::Error { .. } => "Error",
+            Self::EstablishIntro { .. } => "EstablishIntro",
+            Self::IntroEstablished => "IntroEstablished",
+            Self::Introduce1 { .. } => "Introduce1",
+            Self::IntroduceAck => "IntroduceAck",
+            Self::Introduce2 { .. } => "Introduce2",
+            Self::EstablishRendezvous { .. } => "EstablishRendezvous",
+            Self::RendezvousEstablished => "RendezvousEstablished",
+            Self::Rendezvous1 { .. } => "Rendezvous1",
+            Self::Rendezvous2 { .. } => "Rendezvous2",
+            Self::Stream { .. } => "Stream",
+        }
+    }
+}
+
+/// Longest piece of remote-supplied text kept (characters).
+pub const MAX_REMOTE_TEXT: usize = 300;
+
+/// Make text received from another node safe to show and log.
+///
+/// Error details in `LinkError`, `RelayCmd::Error`, and directory answers
+/// are chosen by the remote side. A hostile relay could put terminal escape
+/// sequences, fake log lines (newlines), or bidirectional-override
+/// characters in them. This replaces every control and formatting
+/// character with `?` and truncates to [`MAX_REMOTE_TEXT`] characters.
+pub fn sanitize_remote_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_REMOTE_TEXT));
+    for (i, c) in text.chars().enumerate() {
+        if i == MAX_REMOTE_TEXT {
+            out.push('…');
+            break;
+        }
+        let unsafe_char = c.is_control()
+            // Bidirectional overrides/isolates ("Trojan Source") and other
+            // invisible formatting characters.
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        out.push(if unsafe_char { '?' } else { c });
+    }
+    out
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     postcard::to_stdvec(value).expect("MORP types always serialize")
 }
@@ -240,5 +306,68 @@ mod tests {
     fn garbage_does_not_decode() {
         assert!(decode::<LinkMsg>(&[0xff, 0xff, 0xff]).is_err());
         assert!(decode::<LayerBody>(&[]).is_err());
+    }
+
+    #[test]
+    fn remote_text_is_stripped_of_control_and_bidi_characters() {
+        let hostile = "ok\x1b[2J\x1b]0;pwned\x07\nINFO fake log line\r\u{202e}gnp.exe\u{2066}";
+        let clean = sanitize_remote_text(hostile);
+        assert!(!clean.chars().any(|c| c.is_control()), "{clean:?}");
+        assert!(!clean.contains('\u{202e}') && !clean.contains('\u{2066}'));
+        assert!(clean.starts_with("ok?[2J"));
+        let long = "x".repeat(10_000);
+        assert_eq!(
+            sanitize_remote_text(&long).chars().count(),
+            MAX_REMOTE_TEXT + 1
+        );
+        assert_eq!(
+            sanitize_remote_text("relay1 (entry): ok"),
+            "relay1 (entry): ok"
+        );
+    }
+
+    /// Random and mutated inputs never panic any decoder (a cheap stand-in
+    /// for fuzzing; see docs/SECURITY_MODEL.md).
+    #[test]
+    fn decoders_survive_random_and_mutated_input() {
+        let samples = [
+            encode(&LinkMsg::Relay {
+                circ: 9,
+                cell: vec![1; 64],
+            }),
+            encode(&LinkMsg::LinkError {
+                code: LinkErrorCode::Malformed,
+                detail: "x".into(),
+            }),
+            encode(&LayerBody::Cmd(RelayCmd::Introduce1 {
+                auth_key: [3; 32],
+                payload: vec![4; 40],
+            })),
+            encode(&LayerBody::Relay(vec![5; 100])),
+        ];
+        let mut state = u64::from_le_bytes(crate::crypto::random_bytes::<8>()) | 1;
+        let mut next = move || {
+            // xorshift64: fast, deterministic per seed, good enough here.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut bytes = samples[(next() % samples.len() as u64) as usize].clone();
+            match next() % 3 {
+                0 => {
+                    let i = (next() as usize) % bytes.len();
+                    bytes[i] ^= 1 << (next() % 8);
+                }
+                1 => bytes.truncate((next() as usize) % bytes.len()),
+                _ => {
+                    bytes = (0..(next() % 80)).map(|_| next() as u8).collect();
+                }
+            }
+            let _ = decode::<LinkMsg>(&bytes);
+            let _ = decode::<LayerBody>(&bytes);
+            let _ = decode::<RelayCmd>(&bytes);
+        }
     }
 }

@@ -90,6 +90,9 @@ impl AppForwarder {
             _ => return text(405, "Only GET and HEAD are supported over MORP."),
         };
         let path = &request.path;
+        if path.len() > super::session::MAX_PATH_LEN {
+            return text(414, "Request path too long.");
+        }
         if !path.starts_with('/') || path.chars().any(|c| c.is_control() || c == ' ') {
             return text(400, "Bad request path.");
         }

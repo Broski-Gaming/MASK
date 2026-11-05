@@ -32,6 +32,12 @@ pub const MAX_BODY: u64 = 16 * 1024 * 1024;
 pub const CHUNK: usize = 32 * 1024;
 /// Requests in flight per session.
 pub const MAX_IN_FLIGHT: usize = 64;
+/// Response bytes a client buffers at once over all in-flight requests
+/// (v0.7). Without it a hostile service could announce 64 responses of
+/// [`MAX_BODY`] each and make the client hold 1 GiB.
+pub const MAX_BUFFERED: u64 = 64 * 1024 * 1024;
+/// Longest request path (with query) a client sends or a service accepts.
+pub const MAX_PATH_LEN: usize = 8 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {
@@ -156,8 +162,18 @@ async fn client_actor(
                     let _ = reply.send(Err(SessionError::TooManyRequests));
                     continue;
                 }
-                let id = next_id;
-                next_id = next_id.wrapping_add(1).max(1);
+                if request.path.len() > MAX_PATH_LEN || request.method.len() > 16 {
+                    let _ = reply.send(Err(SessionError::Closed("request too long".into())));
+                    continue;
+                }
+                // IDs wrap after 2^32 requests; never reuse one still in flight.
+                let id = loop {
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1).max(1);
+                    if !in_flight.contains_key(&id) {
+                        break id;
+                    }
+                };
                 let frame = match send.seal(&encode(&ClientFrame::Request { id, request })) {
                     Ok(frame) => frame,
                     Err(e) => break format!("cannot seal request: {e}"),
@@ -197,6 +213,12 @@ fn deliver(in_flight: &mut HashMap<u32, InFlight>, frame: ServiceFrame) -> Resul
     let id = match &frame {
         ServiceFrame::Head { id, .. } | ServiceFrame::Body { id, .. } => *id,
     };
+    // Bytes already announced by other in-flight responses (quota check).
+    let announced_elsewhere: u64 = in_flight
+        .iter()
+        .filter(|(other, _)| **other != id)
+        .filter_map(|(_, e)| e.head.as_ref().map(|(_, _, len)| *len))
+        .sum();
     let Some(entry) = in_flight.get_mut(&id) else {
         return Err(format!("service answered unknown request {id}"));
     };
@@ -212,6 +234,11 @@ fn deliver(in_flight: &mut HashMap<u32, InFlight>, frame: ServiceFrame) -> Resul
             }
             if length > MAX_BODY {
                 return Err(format!("response of {length} bytes exceeds the limit"));
+            }
+            if announced_elsewhere + length > MAX_BUFFERED {
+                return Err(format!(
+                    "service announced more than {MAX_BUFFERED} bytes in flight"
+                ));
             }
             entry.head = Some((status, content_type, length));
         }
@@ -474,5 +501,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::Closed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn hostile_service_cannot_make_the_client_buffer_without_limit() {
+        // Regression (v0.7): a service could announce MAX_BODY for each of
+        // 64 requests and make the client hold up to 1 GiB.
+        let (client_pipe, service_pipe) = wired(|f| vec![f]);
+        let (ck, sk) = keys();
+        tokio::spawn(async move {
+            // Announces a maximal body for every request, never sends it.
+            let StreamPipe { tx, mut rx } = service_pipe;
+            let mut recv = CellCipher::new(&sk.client_to_service, Direction::Forward);
+            let mut send = CellCipher::new(&sk.service_to_client, Direction::Backward);
+            while let Some(frame) = rx.recv().await {
+                let Ok(ClientFrame::Request { id, .. }) = decode(&recv.open(&frame).unwrap())
+                else {
+                    break;
+                };
+                let head = ServiceFrame::Head {
+                    id,
+                    status: 200,
+                    content_type: "application/octet-stream".into(),
+                    length: MAX_BODY,
+                };
+                if tx.send(send.seal(&encode(&head)).unwrap()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let session = ClientSession::start(client_pipe, ck);
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let s = session.clone();
+                tokio::spawn(async move {
+                    s.request(get(&format!("/{i}")), Duration::from_secs(3))
+                        .await
+                })
+            })
+            .collect();
+        let mut quota = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Err(SessionError::Closed(why)) => quota += usize::from(why.contains("in flight")),
+                other => panic!("expected the session to end, got {other:?}"),
+            }
+        }
+        assert!(quota >= 1, "the quota ended the session");
+        assert!(!session.is_open());
+    }
+
+    #[tokio::test]
+    async fn overlong_request_paths_are_refused_locally() {
+        let (client_pipe, service_pipe) = wired(|f| vec![f]);
+        let (ck, sk) = keys();
+        tokio::spawn(serve(service_pipe, sk, echo_handler()));
+        let session = ClientSession::start(client_pipe, ck);
+        let long = format!("/{}", "a".repeat(MAX_PATH_LEN));
+        assert!(
+            session
+                .request(get(&long), Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        // The session is still usable afterwards.
+        let ok = session
+            .request(get("/x"), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(ok.body, b"GET /x");
     }
 }
