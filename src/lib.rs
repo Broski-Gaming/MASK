@@ -15,3 +15,4 @@
 pub mod address;
 pub mod browser;
 pub mod morp;
+pub mod privacy;

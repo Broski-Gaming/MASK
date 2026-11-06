@@ -28,16 +28,65 @@ use mask_net::config::NetworkConfig;
 use mask_net::directory::DEFAULT_DIRECTORY;
 use mask_net::directory::client::DirectoryClient;
 use mask_net::guards::{GuardConfig, Guards};
-use mask_net::hs::client::{ClientConfig, FetchError, MorpClient};
-use mask_net::hs::session::HttpRequest;
+use std::sync::{Arc, Mutex};
+
+use http::HeaderValue;
+use mask_net::hs::client::{ClientConfig, FetchError, IsolationContext, MorpClient};
+use mask_net::hs::session::{HttpRequest, HttpResponse};
 use mask_net::trust::TrustedRelays;
+use tokio::sync::Semaphore;
 
-/// Restricts `.morp` pages to their own service: no requests to the
-/// internet or to other origins, so a page cannot leak to clearnet.
-const PAGE_CSP: &str = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; \
-    connect-src 'self'; form-action 'self'; base-uri 'self'; frame-ancestors 'self'";
+use crate::privacy::{ERROR_CSP, morp_headers};
 
-const ERROR_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
+/// `morp://` requests handled at once; more get a local error page (a page
+/// cannot queue unbounded work).
+pub const MAX_CONCURRENT_REQUESTS: usize = 64;
+
+/// The browser's `morp://` handler: the MORP client, the current isolation
+/// context (one per browser identity), and a concurrency limit.
+#[derive(Clone)]
+pub struct MorpHandler {
+    client: MorpClient,
+    context: Arc<Mutex<IsolationContext>>,
+    in_flight: Arc<Semaphore>,
+}
+
+impl MorpHandler {
+    pub fn new(client: MorpClient) -> Self {
+        Self {
+            client,
+            context: Arc::new(Mutex::new(IsolationContext::fresh())),
+            in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        }
+    }
+
+    /// "New identity": later requests use a fresh isolation context (new
+    /// sessions, circuits, rendezvous points), and the old context's
+    /// sessions are closed.
+    pub fn new_identity(&self) {
+        let old = std::mem::replace(
+            &mut *self.context.lock().unwrap(),
+            IsolationContext::fresh(),
+        );
+        self.client.close_context(old);
+    }
+
+    pub fn context(&self) -> IsolationContext {
+        *self.context.lock().unwrap()
+    }
+
+    /// Handle one `morp://` request in the current context.
+    pub async fn handle(&self, method: &str, uri: &str) -> Response<Vec<u8>> {
+        let Ok(_permit) = self.in_flight.try_acquire() else {
+            return error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many requests",
+                "This page made too many .morp requests at once.",
+            );
+        };
+        handle_in(&self.client, self.context(), method, uri).await
+    }
+}
 
 /// The browser's MORP client.
 ///
@@ -88,8 +137,44 @@ pub fn morp_client() -> Result<MorpClient, mask_net::NetError> {
     ))
 }
 
-/// Handle one `morp://` request.
+/// Handle one `morp://` request in the default isolation context.
 pub async fn handle(client: &MorpClient, method: &str, uri: &str) -> Response<Vec<u8>> {
+    handle_in(client, IsolationContext::DEFAULT, method, uri).await
+}
+
+/// The page as WebKit gets it. Everything from the service is checked:
+/// a status outside 200-599 or a content type that is not a valid header
+/// value (a hostile service could send newlines to inject headers) is
+/// replaced, never trusted. Regression (v0.7): an invalid content type used
+/// to make the handler panic.
+pub fn page_response(page: HttpResponse, method: &str) -> Response<Vec<u8>> {
+    let status = StatusCode::from_u16(page.status)
+        .ok()
+        .filter(|s| (200..600).contains(&s.as_u16()))
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = HeaderValue::from_str(&page.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type);
+    for (name, value) in morp_headers() {
+        response = response.header(name, value);
+    }
+    let body = if method == "HEAD" {
+        Vec::new()
+    } else {
+        page.body
+    };
+    response.body(body).expect("only checked header values")
+}
+
+/// Handle one `morp://` request in `context`.
+pub async fn handle_in(
+    client: &MorpClient,
+    context: IsolationContext,
+    method: &str,
+    uri: &str,
+) -> Response<Vec<u8>> {
     if method != "GET" && method != "HEAD" {
         return error_page(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -112,21 +197,11 @@ pub async fn handle(client: &MorpClient, method: &str, uri: &str) -> Response<Ve
         method: method.to_owned(),
         path,
     };
-    match client.fetch(&address, request).await {
-        Ok(page) => {
-            let status = StatusCode::from_u16(page.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, page.content_type)
-                .header(header::CONTENT_SECURITY_POLICY, PAGE_CSP)
-                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-                .header(header::CACHE_CONTROL, "no-store")
-                .header(header::REFERRER_POLICY, "no-referrer")
-                .body(page.body)
-                .expect("valid response")
-        }
+    match client.fetch_in(context, &address, request).await {
+        Ok(page) => page_response(page, method),
         Err(e) => {
-            tracing::warn!(address = %address, error = %e, "morp request failed");
+            // The address is browsing history: never logged (v0.7).
+            tracing::warn!(error = %e, "morp request failed");
             let (status, title, hint) = match &e {
                 FetchError::NotFound => (
                     StatusCode::NOT_FOUND,
@@ -459,6 +534,59 @@ mod tests {
         let url = ServiceKeys::generate().address().url();
         let page = handle(&client, "POST", &url).await;
         assert_eq!(page.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn hostile_status_and_content_type_cannot_break_the_handler() {
+        // Regression (v0.7): an invalid content type from the service made
+        // the handler panic (the page then hung); 1xx codes passed through.
+        let page = HttpResponse {
+            status: 101,
+            content_type: "text/html\r\nSet-Cookie: tracker=1".into(),
+            body: b"<h1>x</h1>".to_vec(),
+        };
+        let r = page_response(page, "GET");
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            r.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert!(!r.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[test]
+    fn morp_pages_get_the_privacy_headers_and_head_has_no_body() {
+        let page = || HttpResponse {
+            status: 200,
+            content_type: "text/html; charset=utf-8".into(),
+            body: b"<h1>x</h1>".to_vec(),
+        };
+        let r = page_response(page(), "GET");
+        for (name, value) in crate::privacy::morp_headers() {
+            assert_eq!(r.headers()[name], value, "{name}");
+        }
+        assert_eq!(r.body(), b"<h1>x</h1>");
+        assert!(page_response(page(), "HEAD").body().is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_identity_gets_a_new_session_and_rendezvous() {
+        let w = world(true).await;
+        let handler = MorpHandler::new(w.client.clone());
+        let joins = || -> u64 {
+            w.rendezvous
+                .iter()
+                .map(|h| h.stats().rendezvous_joins)
+                .sum()
+        };
+        assert_eq!(handler.handle("GET", &w.url).await.status(), StatusCode::OK);
+        assert_eq!(handler.handle("GET", &w.url).await.status(), StatusCode::OK);
+        assert_eq!(joins(), 1, "same identity, same session");
+        let before = handler.context();
+        handler.new_identity();
+        assert_ne!(handler.context(), before);
+        assert_eq!(handler.handle("GET", &w.url).await.status(), StatusCode::OK);
+        assert_eq!(joins(), 2, "a new identity uses new circuits");
     }
 
     #[test]
