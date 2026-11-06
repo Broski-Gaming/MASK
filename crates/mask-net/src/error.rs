@@ -46,6 +46,9 @@ pub enum NetError {
     },
     /// The component was shut down.
     Shutdown,
+    /// No entry guard can be used (all down, or all related to the last
+    /// hop). Fails closed: no unrelated entry relay is tried instead.
+    NoGuard(String),
 }
 
 impl fmt::Display for NetError {
@@ -76,6 +79,7 @@ impl fmt::Display for NetError {
                 write!(f, "connection from {origin} to {addr} denied by policy")
             }
             Self::Shutdown => write!(f, "shut down"),
+            Self::NoGuard(why) => write!(f, "no usable entry guard: {why}"),
         }
     }
 }

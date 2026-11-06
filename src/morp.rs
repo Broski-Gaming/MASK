@@ -27,6 +27,7 @@ use mask_net::authority::client::AuthorityClient;
 use mask_net::config::NetworkConfig;
 use mask_net::directory::DEFAULT_DIRECTORY;
 use mask_net::directory::client::DirectoryClient;
+use mask_net::guards::{GuardConfig, Guards};
 use mask_net::hs::client::{ClientConfig, FetchError, MorpClient};
 use mask_net::hs::session::HttpRequest;
 use mask_net::trust::TrustedRelays;
@@ -48,7 +49,13 @@ const ERROR_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
 /// Local mode (one machine, the default):
 /// - `MASK_DIRECTORY` (default 127.0.0.1:7200): service directory.
 /// - `MASK_RELAY_DIRECTORY` (default `runtime/directory`): relay descriptors.
+///
+/// Both modes keep the browser's entry guards (v0.7) in `MASK_STATE_DIR`
+/// (default `runtime/state`), as `browser-guards-<network>.json` (0600).
 pub fn morp_client() -> Result<MorpClient, mask_net::NetError> {
+    let state_dir = std::env::var_os("MASK_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("runtime/state"));
     if let Some(path) = std::env::var_os("MASK_NETWORK") {
         let network = NetworkConfig::load(std::path::Path::new(&path))?;
         tracing::info!(
@@ -57,11 +64,14 @@ pub fn morp_client() -> Result<MorpClient, mask_net::NetError> {
             authorities = network.authorities.len(),
             "MORP network mode"
         );
-        let relays = TrustedRelays::consensus(network.scope);
-        return Ok(MorpClient::new(
-            AuthorityClient::new(network),
-            ClientConfig::new(relays),
-        ));
+        let mut config = ClientConfig::new(TrustedRelays::consensus(network.scope));
+        config.guards = Guards::open_in(
+            &state_dir,
+            "browser",
+            &network.name,
+            GuardConfig::for_network(&network),
+        )?;
+        return Ok(MorpClient::new(AuthorityClient::new(network), config));
     }
     let directory = std::env::var("MASK_DIRECTORY")
         .ok()
@@ -70,9 +80,11 @@ pub fn morp_client() -> Result<MorpClient, mask_net::NetError> {
     let relays = std::env::var("MASK_RELAY_DIRECTORY")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("runtime/directory"));
+    let mut config = ClientConfig::new(relays);
+    config.guards = Guards::open_in(&state_dir, "browser", "local", GuardConfig::default())?;
     Ok(MorpClient::new(
         DirectoryClient::new(directory, Duration::from_secs(5))?,
-        ClientConfig::new(relays),
+        config,
     ))
 }
 

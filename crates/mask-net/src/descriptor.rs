@@ -276,6 +276,20 @@ impl RelayDescriptor {
         }
     }
 
+    /// Same relay, same family (machine), or same operator. Two related
+    /// relays must not be the two ends of one circuit: together they would
+    /// see where the circuit starts and where it ends.
+    pub fn related_to(&self, other: &RelayDescriptor) -> bool {
+        self.node_id == other.node_id
+            || self.family_key() == other.family_key()
+            || self.operator_key() == other.operator_key()
+    }
+
+    /// Same address network ([`subnet_key`](Self::subnet_key)).
+    pub fn same_subnet(&self, other: &RelayDescriptor) -> bool {
+        self.subnet_key() == other.subnet_key()
+    }
+
     /// The network the relay's address belongs to, for path diversity: the
     /// IPv4 /16 or the IPv6 /32 (as Tor uses). Relays on one network are
     /// more likely to be watched by the same observer.
@@ -401,6 +415,11 @@ impl CircuitPath {
     }
 }
 
+fn random_element<T>(items: &[T]) -> &T {
+    let index = u64::from_le_bytes(crate::crypto::random_bytes::<8>()) as usize % items.len();
+    &items[index]
+}
+
 /// Verified descriptors loaded from a directory folder.
 #[derive(Clone, Debug, Default)]
 pub struct Directory {
@@ -482,6 +501,89 @@ impl Directory {
         self.pick(role, &[], &[], avoid)
     }
 
+    /// A uniformly random relay with `role` that is not in `exclude`
+    /// (never chosen), preferring, in this order: healthy and unrelated to
+    /// every relay in `unrelated_to` (other family and operator); healthy;
+    /// unrelated; anything left.
+    pub fn pick_unrelated(
+        &self,
+        role: Role,
+        exclude: &[NodeId],
+        unrelated_to: &[&RelayDescriptor],
+        unhealthy: &[NodeId],
+    ) -> Option<RelayDescriptor> {
+        let all: Vec<&RelayDescriptor> = self
+            .relays
+            .iter()
+            .filter(|d| d.role == role && !exclude.contains(&d.node_id))
+            .collect();
+        let healthy = |d: &&RelayDescriptor| !unhealthy.contains(&d.node_id);
+        let unrelated = |d: &&RelayDescriptor| !unrelated_to.iter().any(|o| d.related_to(o));
+        let tiers = [
+            all.iter()
+                .copied()
+                .filter(|d| healthy(d) && unrelated(d))
+                .collect::<Vec<_>>(),
+            all.iter().copied().filter(healthy).collect(),
+            all.iter().copied().filter(unrelated).collect(),
+            all.clone(),
+        ];
+        let pool = tiers.into_iter().find(|t| !t.is_empty())?;
+        Some((*random_element(&pool)).clone())
+    }
+
+    /// A middle relay for a circuit from `entry` to `last` (both fixed),
+    /// preferring, in this order: healthy, unrelated to both ends, and on
+    /// another /16 than both; healthy and unrelated to both; healthy;
+    /// anything. Never `entry` or `last` itself.
+    pub fn middle_between(
+        &self,
+        entry: &RelayDescriptor,
+        last: &RelayDescriptor,
+        unhealthy: &[NodeId],
+    ) -> Option<RelayDescriptor> {
+        let all: Vec<&RelayDescriptor> = self
+            .relays
+            .iter()
+            .filter(|d| {
+                d.role == Role::Middle && d.node_id != entry.node_id && d.node_id != last.node_id
+            })
+            .collect();
+        let healthy = |d: &&RelayDescriptor| !unhealthy.contains(&d.node_id);
+        let unrelated = |d: &&RelayDescriptor| !d.related_to(entry) && !d.related_to(last);
+        let other_net = |d: &&RelayDescriptor| !d.same_subnet(entry) && !d.same_subnet(last);
+        let tiers = [
+            all.iter()
+                .copied()
+                .filter(|d| healthy(d) && unrelated(d) && other_net(d))
+                .collect::<Vec<_>>(),
+            all.iter()
+                .copied()
+                .filter(|d| healthy(d) && unrelated(d))
+                .collect(),
+            all.iter().copied().filter(healthy).collect(),
+            all.clone(),
+        ];
+        let pool = tiers.into_iter().find(|t| !t.is_empty())?;
+        Some((*random_element(&pool)).clone())
+    }
+
+    /// `entry` → (chosen middle) → `last`. The caller picked `entry` (an
+    /// entry guard) unrelated to `last`; see [`middle_between`].
+    ///
+    /// [`middle_between`]: Directory::middle_between
+    pub fn path_through(
+        &self,
+        entry: &RelayDescriptor,
+        last: &RelayDescriptor,
+        unhealthy: &[NodeId],
+    ) -> Result<CircuitPath, NetError> {
+        let middle = self
+            .middle_between(entry, last, unhealthy)
+            .ok_or_else(|| NetError::InvalidConfig("no middle relay in the directory".into()))?;
+        CircuitPath::new(entry.clone(), middle, last.clone())
+    }
+
     /// The relay with this identity, if the directory has it.
     pub fn find(&self, node_id: &NodeId) -> Option<&RelayDescriptor> {
         self.relays.iter().find(|d| d.node_id == *node_id)
@@ -532,7 +634,12 @@ impl Directory {
             .copied()
             .filter(|(e, m)| {
                 let (fe, fm) = (e.family_key(), m.family_key());
-                fe != fm && fe != last_family && fm != last_family
+                fe != fm
+                    && fe != last_family
+                    && fm != last_family
+                    && !e.related_to(m)
+                    && !e.related_to(last)
+                    && !m.related_to(last)
             })
             .collect();
         let pool = [diverse, healthy_pairs, pairs]
@@ -746,6 +853,49 @@ mod tests {
             assert_eq!(path.entry.node_id, entry2.node_id);
             assert_eq!(path.middle.node_id, middle1.node_id);
         }
+    }
+
+    #[test]
+    fn middles_avoid_the_family_operator_and_network_of_both_ends() {
+        let make = |nick: &str, role: Role, addr: &str, family: &str, operator: &str| {
+            let mut d = RelayDescriptor::sign_with_family(
+                &RelayKeys::generate(),
+                nick,
+                role,
+                addr.parse().unwrap(),
+                family,
+            );
+            d.operator = operator.into();
+            d
+        };
+        let entry = make("entry", Role::Entry, "10.1.0.1:7101", "a", "alice");
+        let last = make("rv", Role::Rendezvous, "10.2.0.1:7104", "b", "bob");
+        let same_family = make("m-fam", Role::Middle, "10.3.0.1:7102", "a", "carol");
+        let same_operator = make("m-op", Role::Middle, "10.4.0.1:7102", "c", "bob");
+        let same_network = make("m-net", Role::Middle, "10.1.9.9:7102", "d", "dave");
+        let good = make("m-good", Role::Middle, "10.5.0.1:7102", "e", "erin");
+        let mut relays = vec![
+            entry.clone(),
+            last.clone(),
+            same_family,
+            same_operator,
+            same_network.clone(),
+            good.clone(),
+        ];
+        let directory = Directory::from_descriptors(relays.clone()).unwrap();
+        for _ in 0..30 {
+            let path = directory.path_through(&entry, &last, &[]).unwrap();
+            assert_eq!(path.middle.nickname, "m-good");
+        }
+        // Without it: unrelated beats "same network" being avoided.
+        relays.retain(|d| d.nickname != "m-good");
+        let directory = Directory::from_descriptors(relays).unwrap();
+        for _ in 0..30 {
+            let path = directory.path_through(&entry, &last, &[]).unwrap();
+            assert_eq!(path.middle.nickname, "m-net");
+        }
+        assert!(entry.related_to(&make("x", Role::Middle, "10.9.0.1:1", "z", "alice")));
+        assert!(!entry.related_to(&good));
     }
 
     #[test]

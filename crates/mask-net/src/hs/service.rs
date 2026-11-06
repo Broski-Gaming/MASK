@@ -31,6 +31,7 @@ use super::session::{self, Handler, HttpRequest};
 use crate::NetError;
 use crate::address::MorpAddress;
 use crate::client::{Circuit, build_circuit_to};
+use crate::guards::{GuardConfig, Guards};
 use crate::identity::{NodeId, Role};
 use crate::limits::{Rate, TokenBucket};
 use crate::protocol::RelayCmd;
@@ -62,6 +63,9 @@ pub struct HostConfig {
     pub introduction_rate: Rate,
     /// Rendezvous circuits being built at once.
     pub max_pending_rendezvous: usize,
+    /// The service's entry guards (v0.7). In memory by default;
+    /// `mask-service host` keeps them next to the service key.
+    pub guards: Guards,
 }
 
 impl HostConfig {
@@ -78,6 +82,7 @@ impl HostConfig {
             max_introductions_per_intro: 16_384,
             introduction_rate: Rate::new(10.0, 64),
             max_pending_rendezvous: 16,
+            guards: Guards::ephemeral(GuardConfig::default()),
         }
     }
 }
@@ -299,10 +304,16 @@ async fn establish_intro(
     let chosen = Mutex::new(None);
     let built = build_circuit_to(
         &ctx.config.relays,
-        |directory, unhealthy| {
-            let pick = directory
-                .pick(Role::Rendezvous, avoid, &[], unhealthy)
-                .filter(|d| !avoid.contains(&d.node_id));
+        &ctx.config.guards,
+        |directory, hints| {
+            // An unused rendezvous-role relay, preferably healthy and
+            // unrelated to our guard (so the circuit can use the guard).
+            let pick = directory.pick_unrelated(
+                Role::Rendezvous,
+                avoid,
+                &hints.unrelated_to(),
+                hints.unhealthy,
+            );
             *chosen.lock().unwrap() = pick.as_ref().map(|d| d.node_id);
             pick
         },
@@ -444,6 +455,7 @@ async fn handle_introduction(ctx: Arc<Ctx>, intro: Introduction) {
         // point (fresh entry and middle; retried on another path if needed).
         let (_link, mut circuit, _path) = build_circuit_to(
             &ctx.config.relays,
+            &ctx.config.guards,
             |_, _| Some(rendezvous.clone()),
             ctx.config.timeouts,
             &ctx.config.policy,

@@ -12,6 +12,7 @@ use mask_net::authority::client::{AuthorityClient, spawn_refresher};
 use mask_net::config::NetworkConfig;
 use mask_net::directory::client::DirectoryClient;
 use mask_net::directory::{DEFAULT_DIRECTORY, ServiceDirectory};
+use mask_net::guards::{GuardConfig, Guards};
 use mask_net::hs::app::serve_site;
 use mask_net::hs::client::{ClientConfig, MorpClient};
 use mask_net::hs::service::{HiddenService, HostConfig};
@@ -44,6 +45,11 @@ struct Args {
     /// Folder of relay descriptors published by mask-relay (local mode).
     #[arg(long, global = true, default_value = "runtime/directory")]
     relay_directory: PathBuf,
+
+    /// Folder for this client's private state: its entry guards (fetch,
+    /// verify). Hosts keep their guards next to the service key.
+    #[arg(long, global = true, default_value = "runtime/state")]
+    state_dir: PathBuf,
 
     /// Network mode (v0.6 testnet): use the directory authorities and the
     /// signed relay consensus described by this network.toml instead of
@@ -125,16 +131,34 @@ async fn main() -> ExitCode {
     }
 }
 
+/// What `open_network` found: the service directory, the relays, the
+/// network's name ("local" in local mode), and guard settings.
+struct Network {
+    directory: ServiceDirectory,
+    relays: TrustedRelays,
+    name: String,
+    guard_config: GuardConfig,
+}
+
+impl Network {
+    /// Persistent entry guards in `dir` for component `who`.
+    fn guards(&self, dir: &Path, who: &str) -> Result<Guards, String> {
+        Guards::open_in(dir, who, &self.name, self.guard_config).map_err(|e| e.to_string())
+    }
+}
+
 /// The service directory and relay source for this run.
-async fn open_network(args: &Args) -> Result<(ServiceDirectory, TrustedRelays), String> {
+async fn open_network(args: &Args) -> Result<Network, String> {
     match &args.network {
         None => {
             let directory = DirectoryClient::new(args.directory, Duration::from_secs(5))
                 .map_err(|e| e.to_string())?;
-            Ok((
-                directory.into(),
-                TrustedRelays::from(args.relay_directory.clone()),
-            ))
+            Ok(Network {
+                directory: directory.into(),
+                relays: TrustedRelays::from(args.relay_directory.clone()),
+                name: "local".into(),
+                guard_config: GuardConfig::default(),
+            })
         }
         Some(path) => {
             let network = NetworkConfig::load(path).map_err(|e| e.to_string())?;
@@ -149,7 +173,14 @@ async fn open_network(args: &Args) -> Result<(ServiceDirectory, TrustedRelays), 
                 "Network \"{}\": verified consensus with {count} relay(s).",
                 authorities.network().name
             );
-            Ok((authorities.into(), relays))
+            let name = authorities.network().name.clone();
+            let guard_config = GuardConfig::for_network(authorities.network());
+            Ok(Network {
+                directory: authorities.into(),
+                relays,
+                name,
+                guard_config,
+            })
         }
     }
 }
@@ -235,7 +266,9 @@ async fn host(
     let address = parse(address)?;
     let identity =
         ServiceKeys::load_address(&args.services_dir, &address).map_err(|e| e.to_string())?;
-    let (client, relays) = open_network(args).await?;
+    let network = open_network(args).await?;
+    let guards = network.guards(&args.services_dir.join(address.id()), "service")?;
+    let (client, relays) = (network.directory, network.relays);
 
     // The local web application: built-in static site or the user's own app.
     let (app_addr, app_desc) = match (site, app) {
@@ -268,6 +301,7 @@ async fn host(
     }
     let mut config = HostConfig::new(relays, app_addr);
     config.intro_points = intro_points;
+    config.guards = guards;
     println!("Building introduction circuits through MORP relays…");
     let service = HiddenService::start(identity, config).await.map_err(|e| {
         format!(
@@ -396,7 +430,9 @@ async fn replace_intro_points(service: &HiddenService) -> bool {
 async fn verify(args: &Args, address: &str) -> Result<(), String> {
     let address = parse(address)?;
     println!("1. Address format and checksum: OK");
-    let (directory, relays) = open_network(args).await?;
+    let network = open_network(args).await?;
+    let guards = network.guards(&args.state_dir, "client")?;
+    let (directory, relays) = (network.directory, network.relays);
     let descriptor = directory
         .lookup(&address)
         .await
@@ -407,7 +443,9 @@ async fn verify(args: &Args, address: &str) -> Result<(), String> {
         descriptor.intro_points.len(),
         descriptor.expires.saturating_sub(now_secs())
     );
-    let client = MorpClient::new(directory, ClientConfig::new(relays));
+    let mut config = ClientConfig::new(relays);
+    config.guards = guards;
+    let client = MorpClient::new(directory, config);
     let (_session, route) = client.connect(&address).await.map_err(|e| e.to_string())?;
     println!(
         "3. Reached through relays (intro point: {}; your circuit: {} → {} → {}): OK",
@@ -420,8 +458,10 @@ async fn verify(args: &Args, address: &str) -> Result<(), String> {
 
 async fn fetch_page(args: &Args, address: &str, path: &str) -> Result<(), String> {
     let address = parse(address)?;
-    let (directory, relays) = open_network(args).await?;
-    let client = MorpClient::new(directory, ClientConfig::new(relays));
+    let network = open_network(args).await?;
+    let mut config = ClientConfig::new(network.relays.clone());
+    config.guards = network.guards(&args.state_dir, "client")?;
+    let client = MorpClient::new(network.directory, config);
     let path = if path.starts_with('/') {
         path.to_owned()
     } else {

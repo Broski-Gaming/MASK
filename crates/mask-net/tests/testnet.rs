@@ -947,3 +947,183 @@ async fn consensus_carries_authority_assigned_operators_and_listing_times() {
         assert!(d.listed_since > 0 && d.listed_since <= now + 1, "{d:?}");
     }
 }
+
+// ===================================================== v0.7: entry guards
+
+const THREE_ENTRIES: [RelaySpec; 7] = [
+    RelaySpec {
+        nick: "entry1",
+        role: Role::Entry,
+        family: "machine-a",
+        operator: "op-a",
+    },
+    RelaySpec {
+        nick: "entry2",
+        role: Role::Entry,
+        family: "machine-b",
+        operator: "op-b",
+    },
+    RelaySpec {
+        nick: "entry3",
+        role: Role::Entry,
+        family: "machine-g",
+        operator: "op-g",
+    },
+    RelaySpec {
+        nick: "middle1",
+        role: Role::Middle,
+        family: "machine-c",
+        operator: "op-c",
+    },
+    RelaySpec {
+        nick: "middle2",
+        role: Role::Middle,
+        family: "machine-d",
+        operator: "op-d",
+    },
+    RelaySpec {
+        nick: "rv1",
+        role: Role::Rendezvous,
+        family: "machine-e",
+        operator: "op-e",
+    },
+    RelaySpec {
+        nick: "rv2",
+        role: Role::Rendezvous,
+        family: "machine-f",
+        operator: "op-f",
+    },
+];
+
+/// Entry relays the given origin connected to.
+fn entries_contacted(net: &Testnet, origin: &str) -> std::collections::HashSet<SocketAddr> {
+    let entries = net.entries();
+    net.log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(o, a)| o == origin && entries.contains(a))
+        .map(|(_, a)| *a)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_client_reaches_only_its_entry_guard() {
+    // Regression (v0.7): every circuit used a random entry relay, so over
+    // time a client used all of them, including any hostile one.
+    let net = Testnet::start(&THREE_ENTRIES).await;
+    let (_service, address, _) = net.host(2).await;
+    let client = net.client();
+    net.log.lock().unwrap().clear();
+    for _ in 0..6 {
+        let (session, _) = client.connect(&address).await.unwrap();
+        session
+            .request(get(), Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+    let used = entries_contacted(&net, "client");
+    assert_eq!(used.len(), 1, "one guard for every circuit: {used:?}");
+}
+
+#[tokio::test]
+async fn when_its_guards_are_down_a_client_fails_closed() {
+    let net = Testnet::start(&THREE_ENTRIES).await;
+    let (service, address, _) = net.host(2).await;
+    // What `mask-service host` does when relays vanish: replace the lost
+    // intro points (the service may use the same entry relays) and republish.
+    let recover_service = || async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        service.replenish().await.unwrap();
+        net.authorities("service")
+            .publish_service(&service.descriptor(now_secs(), 600, now_millis()))
+            .await
+            .unwrap();
+    };
+    let mut config = ClientConfig::new(TrustedRelays::consensus(NetworkScope::Private));
+    config.timeouts = timeouts();
+    config.policy = net.policy.clone();
+    config.connect_timeout = Duration::from_secs(20);
+    config.rendezvous_timeout = Duration::from_secs(6);
+    let guards = config.guards.clone();
+    let client = MorpClient::new(net.authorities("client"), config);
+    client.connect(&address).await.unwrap();
+    let sampled: Vec<String> = guards.list().into_iter().map(|g| g.nickname).collect();
+    assert_eq!(sampled.len(), 2, "two primary guards");
+
+    // The first guard goes away: the second takes over.
+    net.relay(&sampled[0]).handle.shutdown();
+    recover_service().await;
+    client.close_all();
+    let (_, route) = client.connect(&address).await.unwrap();
+    assert_eq!(route.entry, sampled[1]);
+
+    // Both are gone: no circuit, and the third entry relay is never tried.
+    net.relay(&sampled[1]).handle.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.close_all();
+    net.log.lock().unwrap().clear();
+    let err = client.connect(&address).await.err().expect("must fail");
+    assert!(err.to_string().contains("guard"), "{err}");
+    let spare = THREE_ENTRIES
+        .iter()
+        .find(|s| s.role == Role::Entry && !sampled.iter().any(|n| n == s.nick))
+        .unwrap();
+    let spare_addr = net.relay(spare.nick).descriptor.addr;
+    assert!(
+        !entries_contacted(&net, "client").contains(&spare_addr),
+        "the spare entry relay was contacted"
+    );
+    assert_eq!(guards.list().len(), 2, "no new guard was sampled");
+}
+
+#[tokio::test]
+async fn paths_avoid_a_shared_operator_across_families() {
+    // Two machines run by one operator are as risky as one machine: the
+    // entry guard and the rendezvous point must not share an operator.
+    let specs = [
+        RelaySpec {
+            nick: "entry1",
+            role: Role::Entry,
+            family: "machine-a",
+            operator: "mallory",
+        },
+        RelaySpec {
+            nick: "entry2",
+            role: Role::Entry,
+            family: "machine-b",
+            operator: "alice",
+        },
+        RelaySpec {
+            nick: "middle1",
+            role: Role::Middle,
+            family: "machine-c",
+            operator: "bob",
+        },
+        RelaySpec {
+            nick: "rv1",
+            role: Role::Rendezvous,
+            family: "machine-d",
+            operator: "mallory",
+        },
+        RelaySpec {
+            nick: "rv2",
+            role: Role::Rendezvous,
+            family: "machine-e",
+            operator: "carol",
+        },
+    ];
+    let net = Testnet::start(&specs).await;
+    let (_service, address, _) = net.host(1).await;
+    for _ in 0..6 {
+        let (_, route) = net.client().connect(&address).await.unwrap();
+        let op = |nick: &str| specs.iter().find(|s| s.nick == nick).unwrap().operator;
+        assert_ne!(
+            op(&route.entry),
+            op(&route.rendezvous),
+            "entry {} and rendezvous {} share an operator",
+            route.entry,
+            route.rendezvous
+        );
+    }
+}

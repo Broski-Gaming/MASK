@@ -31,9 +31,9 @@ use crate::NetError;
 use crate::address::MorpAddress;
 use crate::client::build_circuit_to;
 use crate::crypto::random_bytes;
-use crate::descriptor::CircuitPath;
 use crate::directory::ServiceDirectory;
 use crate::directory::client::LookupError;
+use crate::guards::{GuardConfig, Guards};
 use crate::identity::Role;
 use crate::protocol::{ErrorCode, RelayCmd};
 use crate::transport::{ConnectPolicy, Timeouts};
@@ -55,6 +55,9 @@ pub struct ClientConfig {
     /// Time allowed for the service to arrive at the rendezvous point.
     pub rendezvous_timeout: Duration,
     pub request_timeout: Duration,
+    /// This client's entry guards (v0.7). In memory by default; the
+    /// browser and the CLI use [`Guards::persistent`].
+    pub guards: Guards,
 }
 
 impl ClientConfig {
@@ -67,6 +70,7 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(45),
             rendezvous_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(30),
+            guards: Guards::ephemeral(GuardConfig::default()),
         }
     }
 }
@@ -236,12 +240,17 @@ impl MorpClient {
         };
         let (link, mut rp_circuit, rp_path) = build_circuit_to(
             &config.relays,
-            |directory, unhealthy| {
+            &config.guards,
+            |directory, hints| {
                 // Never a relay known to be failing (if any other exists);
-                // preferably not one of the service's intro points.
+                // preferably unrelated to our guard and not one of the
+                // service's intro points.
+                let guard = hints.unrelated_to();
                 directory
-                    .pick(Role::Rendezvous, unhealthy, &[], &intro_relays)
-                    .or_else(|| directory.random_relay(Role::Rendezvous, &intro_relays))
+                    .pick_unrelated(Role::Rendezvous, hints.unhealthy, &guard, &intro_relays)
+                    .or_else(|| {
+                        directory.pick_unrelated(Role::Rendezvous, &[], &guard, &intro_relays)
+                    })
             },
             config.timeouts,
             &config.policy,
@@ -277,12 +286,26 @@ impl MorpClient {
                 continue;
             };
             let attempt = async {
-                let path = CircuitPath::new(
-                    rp_path.entry.clone(),
-                    rp_path.middle.clone(),
-                    intro_relay.clone(),
-                )?;
-                let mut circuit = link.build_circuit(&path).await?;
+                // Reuse our link to the guard when it may be used with this
+                // intro point; otherwise a separate circuit through another
+                // (unrelated) guard, or none at all.
+                let mut circuit = if rp_path.entry.related_to(&intro_relay) {
+                    build_circuit_to(
+                        &config.relays,
+                        &config.guards,
+                        |_, _| Some(intro_relay.clone()),
+                        config.timeouts,
+                        &config.policy,
+                        "client",
+                        2,
+                    )
+                    .await?
+                    .1
+                } else {
+                    let unhealthy = config.relays.health().unhealthy();
+                    let path = relays.path_through(&rp_path.entry, &intro_relay, &unhealthy)?;
+                    link.build_circuit(&path).await?
+                };
                 let (client_intro, payload) = ClientIntro::new(
                     *address,
                     &ip.auth_key,

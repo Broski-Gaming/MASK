@@ -259,9 +259,19 @@ fn testnet_of_separate_processes_serves_a_morp_site() {
     );
 
     // 5. A client in another process fetches the page through MORP relays.
+    let state = d.join("state");
+    let state_arg = state.to_str().unwrap();
     let fetch = || {
         Command::new(bin("mask-service"))
-            .args(["--network", net, "fetch", &url, "/"])
+            .args([
+                "--network",
+                net,
+                "--state-dir",
+                state_arg,
+                "fetch",
+                &url,
+                "/",
+            ])
             .output()
             .unwrap()
     };
@@ -281,9 +291,41 @@ fn testnet_of_separate_processes_serves_a_morp_site() {
     assert!(String::from_utf8_lossy(&page.stdout).contains(SITE_TEXT));
     assert!(String::from_utf8_lossy(&page.stderr).contains("via MORP relays"));
 
-    let verify = run(Command::new(bin("mask-service")).args(["--network", net, "verify", &url]));
+    let verify = run(Command::new(bin("mask-service")).args([
+        "--network",
+        net,
+        "--state-dir",
+        state_arg,
+        "verify",
+        &url,
+    ]));
     let verify = String::from_utf8_lossy(&verify.stdout);
     assert!(verify.contains("is authentic"), "{verify}");
+
+    // v0.7: the client processes kept their entry guards in a private
+    // file, and the second process used one of the first one's guards.
+    use std::os::unix::fs::PermissionsExt;
+    let guard_file = state.join("client-guards-proc-testnet.json");
+    let mode = fs::metadata(&guard_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "guard file must be private");
+    let guards = fs::read_to_string(&guard_file).unwrap();
+    let entry_used = verify
+        .split("your circuit: ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .expect("verify prints the circuit");
+    assert!(
+        guards.contains(&format!("\"nickname\": \"{entry_used}\"")),
+        "verify used {entry_used}, not one of the saved guards:\n{guards}"
+    );
+    // The host kept its own guards next to its key, separately.
+    let id = url.trim_start_matches("morp://").trim_end_matches(".morp/");
+    assert!(
+        d.join("services")
+            .join(id)
+            .join("service-guards-proc-testnet.json")
+            .exists()
+    );
 
     // The rendezvous relays joined circuits; no relay logged page content.
     let joined = procs

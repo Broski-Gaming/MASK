@@ -24,6 +24,7 @@ use crate::crypto::ntor::ClientHandshake;
 use crate::crypto::onion::{CellCipher, Direction};
 use crate::descriptor::{CircuitPath, Directory, RelayDescriptor};
 use crate::error::NetError;
+use crate::guards::Guards;
 use crate::identity::{NodeId, Role};
 use crate::protocol::{
     CircId, DestroyReason, ErrorCode, LayerBody, LinkMsg, MAX_DATA_LEN, RelayCmd, decode, encode,
@@ -602,15 +603,36 @@ fn blame(path: &CircuitPath, error: &NetError, connected: bool) -> Option<NodeId
     }
 }
 
-/// Build a three-hop circuit ending at a relay picked by `choose_last`,
-/// retrying up to `attempts` times with fresh paths. Relays that fail are
-/// marked in the trusted set's [`Health`](crate::trust::Health) so later
-/// paths (here and elsewhere in the process) avoid them for a while.
+/// What a last-hop chooser should take into account.
+pub struct LastHopHints<'a> {
+    /// Relays that failed recently (avoid if possible).
+    pub unhealthy: &'a [NodeId],
+    /// The entry guard this circuit will most likely use. Choosing a last
+    /// hop unrelated to it (other family and operator) lets the circuit use
+    /// it; a related last hop forces another guard, or fails.
+    pub guard: Option<&'a RelayDescriptor>,
+}
+
+impl LastHopHints<'_> {
+    /// `guard` as a list, for [`Directory::pick_unrelated`].
+    pub fn unrelated_to(&self) -> Vec<&RelayDescriptor> {
+        self.guard.into_iter().collect()
+    }
+}
+
+/// Build a three-hop circuit **entry guard → middle → last**, ending at a
+/// relay picked by `choose_last`, retrying up to `attempts` times. The entry
+/// is always one of `guards` (v0.7) and never related to the last hop; the
+/// middle prefers a family, operator, and network unrelated to both. Relays
+/// that fail are marked in the trusted set's [`Health`](crate::trust::Health)
+/// (and failed guards in `guards`) so later paths avoid them for a while.
 ///
-/// `choose_last(directory, unhealthy)` picks the last hop.
+/// If no guard can be used, this fails with [`NetError::NoGuard`] instead
+/// of trying some other entry relay.
 pub async fn build_circuit_to(
     trusted: &TrustedRelays,
-    choose_last: impl Fn(&Directory, &[NodeId]) -> Option<RelayDescriptor>,
+    guards: &Guards,
+    choose_last: impl Fn(&Directory, &LastHopHints) -> Option<RelayDescriptor>,
     timeouts: Timeouts,
     policy: &ConnectPolicy,
     origin: &str,
@@ -621,12 +643,26 @@ pub async fn build_circuit_to(
     for attempt in 1..=attempts.max(1) {
         let directory = trusted.snapshot()?;
         let unhealthy = health.unhealthy();
-        let Some(last) = choose_last(&directory, &unhealthy) else {
+        let preferred = guards.preferred(&directory, &unhealthy);
+        let hints = LastHopHints {
+            unhealthy: &unhealthy,
+            guard: preferred.as_ref(),
+        };
+        let Some(last) = choose_last(&directory, &hints) else {
             return Err(last_error.unwrap_or_else(|| {
                 NetError::InvalidConfig("no suitable last-hop relay is available".into())
             }));
         };
-        let path = directory.path_avoiding(&last, &unhealthy)?;
+        let entry = match guards.choose(&directory, &last, &unhealthy) {
+            Ok(entry) => entry,
+            Err(e) => {
+                // Fail closed; another attempt may pick another last hop.
+                tracing::warn!(attempt, error = %e, "no entry guard for this circuit");
+                last_error = Some(e);
+                continue;
+            }
+        };
+        let path = directory.path_through(&entry, &last, &unhealthy)?;
         let outcome = match ClientLink::connect_with(&path.entry, timeouts, policy, origin).await {
             Ok(link) => match link.build_circuit(&path).await {
                 Ok(circuit) => Ok((link, circuit)),
@@ -639,6 +675,7 @@ pub async fn build_circuit_to(
                 for hop in path.hops() {
                     health.mark_ok(&hop.node_id);
                 }
+                guards.mark_ok(&path.entry.node_id);
                 return Ok((link, circuit, path));
             }
             Err((e, connected)) => {
@@ -651,6 +688,9 @@ pub async fn build_circuit_to(
                         .unwrap_or_default();
                     tracing::warn!(attempt, relay = %nickname, error = %e, "circuit failed; avoiding relay for a while");
                     health.mark_failed(bad, DEFAULT_PENALTY);
+                    if bad == path.entry.node_id {
+                        guards.mark_failed(&bad);
+                    }
                 } else {
                     tracing::warn!(attempt, error = %e, "circuit failed");
                 }
