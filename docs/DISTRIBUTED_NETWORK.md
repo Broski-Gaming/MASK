@@ -124,7 +124,8 @@ There is no unencrypted fallback.
   private file (`runtime/state/client-guards-<network>.json` for
   `mask-service fetch/verify`, `browser-guards-…` in `MASK_STATE_DIR` for the
   browser, `service-guards-…` next to each service key). When all guards are
-  down the client fails closed instead of trying other entry relays.
+  down the client keeps retrying them (and fails until one is back) instead
+  of trying other entry relays; guards unlisted for 7 days are dropped.
 - *(v0.7)* The guard is never in the last hop's **family** (machine) or
   **operator**; the middle prefers a family, operator, and /16 network
   different from both. MASK-chosen last hops (rendezvous and intro points)

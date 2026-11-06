@@ -416,7 +416,7 @@ capture), and a `set -e` exit in the guard-address helper.
 | Check | Evidence | Result |
 |---|---|---|
 | `cargo fmt --check`, `cargo check`, `cargo clippy --workspace --all-targets` | clean, 0 warnings | Pass |
-| `cargo test --workspace` | **249 passed, 0 failed**, 2 opt-in: 32 browser unit, 132 network unit, 32 MORP, 20 hidden-service, 9 hostile, 3 malicious-relay, 20 testnet, 1 multi-process | Pass |
+| `cargo test --workspace` | **249 passed, 0 failed** at the end of M7 (251 after the debugging pass), 2 opt-in: 32 browser unit, 132 (134) network unit, 32 MORP, 20 hidden-service, 9 hostile, 3 malicious-relay, 20 testnet, 1 multi-process | Pass |
 | Stability | testnet, hostile, hidden_services, morp, malicious_relays: 10 consecutive runs each, 0 failures | Pass |
 | Network namespaces (`scripts/netns-testnet.sh`) | **22 checks passed**, incl. 684-packet LAN capture: no DNS packet, no cli↔svc packet, cli and svc connect only to the authority and their own guards (guard files 0600), no plaintext content/requests/address on the wire, no client/service IP in relay logs, black-holed entry routes → "no usable entry guard" | Pass |
 | Browser leak test (`scripts/browser-leak-test.sh`) | real MASK Browser in a namespace whose only resolver is a DNS canary (positive control passes); hostile `.morp` page: no internet-canary connection, no DNS lookup, no STUN packet, navigation away blocked; hostile clearnet page: no `morp:` load, no `.morp` DNS lookup; MORP-only mode: typed website not contacted; 414-packet capture: everything on loopback, no UDP besides DNS | Pass |
@@ -437,6 +437,25 @@ capture), and a `set -e` exit in the guard-address helper.
   normalised;
 - no coverage-guided fuzzing (random/mutated-input decoder tests only), no
   independent review.
+
+### General debugging pass (after the v0.7 milestones)
+
+Done with the real binaries and logs, not only tests:
+
+| What | Finding | Result |
+|---|---|---|
+| README local-mode workflow (directory, 5 relays, `create`, `host`, `fetch`, `verify`, `mask-client` echo) in a scratch folder | all work; guard file 0600 in a 0700 folder | OK |
+| Entry relay **crashes** (kill -9) and restarts | **Bug:** the guard was marked failed (persisted for 10 min), so every client and the host refused to connect for 10 minutes after the relay was back ("all 1 entry guard(s) are unreachable"); intro points could not be rebuilt either | **Fixed:** with every usable guard failing, the one that failed longest ago is retried (never a new guard); failures are ordered strictly so retries alternate. Re-tested: host re-established its intro points and `fetch` worked right after the restart. Regression tests `a_restarted_guard_works_again_at_once`, `when_every_guard_is_down_they_are_retried_but_none_is_added` |
+| Relays recreated with new identities | **Bug:** the guard sample (max 5) filled with unlisted guards and stayed full until they expired (30-60 days) | **Fixed:** guards unlisted for 7 days are dropped (Tor: 20 days). Test `guards_unlisted_for_too_long_are_dropped` |
+| Guard files written by early v0.7 builds (`failed_until` in seconds) | refused as unreadable | read with the failure time as 0 (usable) |
+| Every WARN/ERROR in a full netns run (`MASK_NETNS_KEEP=1`) | all explained by the scenario (cable cut, shutdown order, briefly different consensus views between machines). Noted, not changed: while views differ the host retries a relay others already dropped, bounded by the next consensus refresh | OK |
+| Panic audit of non-test code (`unwrap`, `expect`, indexing) | `Circuit::seal_for` indexed hops without a bounds check (public API) | returns an error now; the rest are locks, constants, or checked values |
+| HTTPS browsing after the hardening | `https://example.com` loads ("Example Domain") | OK |
+| `cargo doc`, release build | 4 rustdoc warnings (unescaped `<…>`/`[…]`, a private link) | fixed; 0 warnings; release build OK |
+| Repository hygiene | no stray `runtime/` state left by tests or runs | OK |
+
+After the fixes: **251 tests pass** (+2 opt-in), clippy and rustdoc clean,
+netns script (22 checks) and multi-process test pass.
 
 **Compatibility.** v0.7 changes the consensus format (2) and the directory
 protocol (2), and `approved-relays.toml` now requires `family`: upgrade

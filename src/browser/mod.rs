@@ -17,7 +17,7 @@
 //!   third-party cookies are refused.
 //! - "New identity" switches the MORP isolation context (new circuits and
 //!   rendezvous points for every service) and forgets all website data.
-//! - The [network gate](gate) routes every WebKit connection into a black
+//! - The network gate (`gate.rs`) routes every WebKit connection into a black
 //!   hole while a `.morp` page is shown (and always in MORP-only mode), so
 //!   even WebKit's speculative connections cannot reach the internet.
 

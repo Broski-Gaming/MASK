@@ -470,6 +470,13 @@ impl Circuit {
 
     /// Seal `cmd` for hop `target`, then wrap it once for every hop before it.
     pub fn seal_for(&mut self, target: usize, cmd: RelayCmd) -> Result<Vec<u8>, NetError> {
+        if target >= self.hops.len() {
+            return Err(NetError::InvalidConfig(format!(
+                "hop {} does not exist (the circuit has {} hops)",
+                target + 1,
+                self.hops.len()
+            )));
+        }
         let mut cell = self.hops[target]
             .forward
             .seal(&encode(&LayerBody::Cmd(cmd)))?;

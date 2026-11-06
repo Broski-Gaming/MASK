@@ -18,9 +18,10 @@
 //!   hurry, as an attacker would, are not preferred), and relays in a
 //!   family, operator, and /16 network not already among the guards.
 //! - Each guard is kept for a random 30-60 days, then replaced.
-//! - A guard that fails is skipped for [`GuardConfig::retry_after`], then
-//!   tried again. **When every sampled guard is down, no new guard is
-//!   picked:** the client fails closed. Otherwise an attacker who can block
+//! - A guard that fails is skipped for [`GuardConfig::retry_after`] while
+//!   others work. **When every usable guard is down, no new guard is
+//!   picked:** the client retries the guard that failed longest ago, and
+//!   fails if it is still down. Otherwise an attacker who can block
 //!   connections could make the client try entry relays until it reaches
 //!   one of theirs. (Delete the guard file to start over deliberately.)
 //! - A circuit's entry guard must not be related to its last hop (same
@@ -47,7 +48,7 @@ use tracing::{info, warn};
 use crate::NetError;
 use crate::descriptor::{Directory, RelayDescriptor};
 use crate::identity::{NodeId, Role, from_hex, to_hex};
-use crate::service::now_secs;
+use crate::service::{now_millis, now_secs};
 
 const FILE_VERSION: u16 = 1;
 /// A guard file never holds more guards than this (corrupt-file guard).
@@ -67,6 +68,11 @@ pub struct GuardConfig {
     /// Prefer new guards the authority has listed at least this long
     /// (`network.toml` `[relay_policy] guard_min_listed_secs`).
     pub min_listed: Duration,
+    /// A guard missing from the relay list this long is dropped, freeing
+    /// its place in the sample (Tor does the same after 20 days). Without
+    /// this, relays recreated with new identities would leave a client with
+    /// a sample full of dead guards until they expire, weeks later.
+    pub remove_unlisted_after: Duration,
 }
 
 impl GuardConfig {
@@ -87,6 +93,7 @@ impl Default for GuardConfig {
             lifetime: (Duration::from_secs(30 * DAY), Duration::from_secs(60 * DAY)),
             retry_after: Duration::from_secs(600),
             min_listed: Duration::ZERO,
+            remove_unlisted_after: Duration::from_secs(7 * DAY),
         }
     }
 }
@@ -99,8 +106,15 @@ struct Record {
     expires: u64,
     /// A circuit through this guard has worked at least once.
     confirmed: bool,
-    /// Skip until this time (Unix seconds); 0 = usable.
-    failed_until: u64,
+    /// Skip until this time (Unix milliseconds, so failures within one
+    /// second still order the retries); 0 = usable. Files from early v0.7
+    /// builds have `failed_until` (seconds) instead: ignored, read as 0.
+    #[serde(default)]
+    failed_until_ms: u64,
+    /// When the guard was first seen missing from the relay list (Unix
+    /// seconds); 0 = listed.
+    #[serde(default)]
+    unlisted_since: u64,
 }
 
 impl Record {
@@ -236,7 +250,7 @@ impl Guards {
 
     /// The sampled guards, primary first.
     pub fn list(&self) -> Vec<GuardInfo> {
-        let now = now_secs();
+        let now_ms = now_millis();
         self.state
             .lock()
             .unwrap()
@@ -247,7 +261,7 @@ impl Guards {
                     identity: g.id()?,
                     nickname: g.nickname.clone(),
                     confirmed: g.confirmed,
-                    failing: g.failed_until > now,
+                    failing: g.failed_until_ms > now_ms,
                 })
             })
             .collect()
@@ -291,29 +305,37 @@ impl Guards {
         unhealthy: &[NodeId],
     ) -> Result<RelayDescriptor, NetError> {
         let now = now_secs();
+        let now_ms = now_millis();
         let mut state = self.state.lock().unwrap();
-        let mut changed = self.expire(&mut state, now);
+        let mut changed =
+            self.expire(&mut state, now) | self.track_listing(&mut state, directory, now);
         changed |= self.top_up(&mut state, directory, now);
 
         let mut sampled_more = false;
         let result = loop {
             let mut reasons = Vec::new();
             let mut found = None;
+            // A usable guard that recently failed, the one that failed
+            // longest ago: retried when every usable guard is failing.
+            let mut retry: Option<(u64, &RelayDescriptor)> = None;
             for record in &state.guards {
                 let Some(id) = record.id() else { continue };
                 let Some(guard) = directory.find(&id).filter(|d| d.role == Role::Entry) else {
                     reasons.push(format!("{} is not listed", record.nickname));
                     continue;
                 };
-                if record.failed_until > now || unhealthy.contains(&id) {
-                    reasons.push(format!("{} is failing", record.nickname));
-                    continue;
-                }
                 if guard.related_to(last) {
                     reasons.push(format!(
                         "{} shares a family or operator with {}",
                         record.nickname, last.nickname
                     ));
+                    continue;
+                }
+                if record.failed_until_ms > now_ms || unhealthy.contains(&id) {
+                    reasons.push(format!("{} is failing", record.nickname));
+                    if retry.is_none_or(|(until, _)| record.failed_until_ms < until) {
+                        retry = Some((record.failed_until_ms, guard));
+                    }
                     continue;
                 }
                 found = Some(guard.clone());
@@ -322,32 +344,33 @@ impl Guards {
             if let Some(guard) = found {
                 break Ok(guard);
             }
-            // Nothing usable. Sample one more guard only if some sampled
-            // guard is unsuitable for *this* last hop (not merely down):
-            // never because guards are failing (see the module docs).
-            let all_down = state
-                .guards
-                .iter()
-                .all(|g| g.failed_until > now || g.id().is_some_and(|id| unhealthy.contains(&id)));
-            if !all_down && !sampled_more && self.sample_one(&mut state, directory, now) {
+            // Every guard that could carry this circuit is failing: retry
+            // the one that failed longest ago. Retrying a known guard
+            // exposes nothing new; picking *new* guards because ours are
+            // unreachable is what an attacker blocking them would want, so
+            // that never happens. (Regression, v0.7 debugging: without this
+            // retry, a crashed and restarted entry relay locked clients out
+            // for the whole retry period, even across processes.)
+            if let Some((_, guard)) = retry {
+                info!(guard = %guard.nickname, "all usable entry guards failed recently; retrying one");
+                break Ok(guard.clone());
+            }
+            // Nothing usable at all (unlisted, or related to this last hop):
+            // sample one more guard, within the limit.
+            if !sampled_more && self.sample_one(&mut state, directory, now) {
                 sampled_more = true;
                 changed = true;
                 continue;
             }
             break Err(NetError::NoGuard(if state.guards.is_empty() {
                 "no entry relay is available".into()
-            } else if all_down {
-                format!(
-                    "all {} entry guard(s) are unreachable ({}); not choosing new ones \
-                     (delete the guard file to reset deliberately)",
-                    state.guards.len(),
-                    reasons.join("; ")
-                )
             } else {
                 format!(
-                    "no entry guard can be used with last hop {} ({})",
+                    "no entry guard can be used with last hop {} ({}); not choosing more \
+                     than {} guards (delete the guard file to reset deliberately)",
                     last.nickname,
-                    reasons.join("; ")
+                    reasons.join("; "),
+                    self.config.max_sampled
                 )
             }));
         };
@@ -374,11 +397,14 @@ impl Guards {
         unhealthy: &[NodeId],
     ) -> Option<RelayDescriptor> {
         let now = now_secs();
+        let now_ms = now_millis();
         let mut state = self.state.lock().unwrap();
-        let changed = self.expire(&mut state, now) | self.top_up(&mut state, directory, now);
+        let changed = self.expire(&mut state, now)
+            | self.track_listing(&mut state, directory, now)
+            | self.top_up(&mut state, directory, now);
         let found = state.guards.iter().find_map(|g| {
             let id = g.id()?;
-            if g.failed_until > now || unhealthy.contains(&id) {
+            if g.failed_until_ms > now_ms || unhealthy.contains(&id) {
                 return None;
             }
             directory
@@ -392,17 +418,30 @@ impl Guards {
         found
     }
 
-    /// Skip `guard` for [`GuardConfig::retry_after`].
+    /// Skip `guard` for [`GuardConfig::retry_after`]. Each failure is
+    /// recorded as strictly later than every earlier one, so retries go to
+    /// the guard that failed longest ago even when failures happen within
+    /// the same millisecond.
     pub fn mark_failed(&self, guard: &NodeId) {
-        let until = now_secs() + self.config.retry_after.as_secs().max(1);
-        self.update(guard, |g| g.failed_until = until);
+        let latest = {
+            let state = self.state.lock().unwrap();
+            state
+                .guards
+                .iter()
+                .map(|g| g.failed_until_ms)
+                .max()
+                .unwrap_or(0)
+        };
+        let until =
+            (now_millis() + (self.config.retry_after.as_millis() as u64).max(1)).max(latest + 1);
+        self.update(guard, |g| g.failed_until_ms = until);
     }
 
     /// A circuit through `guard` worked.
     pub fn mark_ok(&self, guard: &NodeId) {
         self.update(guard, |g| {
             g.confirmed = true;
-            g.failed_until = 0;
+            g.failed_until_ms = 0;
         });
     }
 
@@ -432,6 +471,39 @@ impl Guards {
             keep
         });
         before != state.guards.len()
+    }
+
+    /// Note which guards are missing from `directory`, and drop those
+    /// missing for longer than [`GuardConfig::remove_unlisted_after`].
+    fn track_listing(&self, state: &mut State, directory: &Directory, now: u64) -> bool {
+        let mut changed = false;
+        for g in &mut state.guards {
+            let listed = g
+                .id()
+                .and_then(|id| directory.find(&id))
+                .is_some_and(|d| d.role == Role::Entry);
+            match (listed, g.unlisted_since) {
+                (true, 0) | (false, 1..) => {}
+                (true, _) => {
+                    g.unlisted_since = 0;
+                    changed = true;
+                }
+                (false, 0) => {
+                    g.unlisted_since = now.max(1);
+                    changed = true;
+                }
+            }
+        }
+        let limit = self.config.remove_unlisted_after.as_secs();
+        let before = state.guards.len();
+        state.guards.retain(|g| {
+            let keep = g.unlisted_since == 0 || now.saturating_sub(g.unlisted_since) < limit;
+            if !keep {
+                info!(guard = %g.nickname, "entry guard no longer listed for a long time; dropped");
+            }
+            keep
+        });
+        changed | (before != state.guards.len())
     }
 
     /// Sample until there are `primary` listed guards (within the limits).
@@ -513,7 +585,8 @@ impl Guards {
             added: now,
             expires: now + lifetime,
             confirmed: false,
-            failed_until: 0,
+            failed_until_ms: 0,
+            unlisted_since: 0,
         });
         true
     }
@@ -591,22 +664,42 @@ mod tests {
     }
 
     #[test]
-    fn when_every_guard_is_down_no_new_guard_is_chosen() {
+    fn when_every_guard_is_down_they_are_retried_but_none_is_added() {
         // Fail-closed: an attacker blocking guards must not be able to make
-        // the client walk through every entry relay.
+        // the client walk through every entry relay. Retrying the same
+        // guards is fine (and needed: a restarted relay must work again).
         let (dir, last) = net(10);
         let guards = Guards::ephemeral(config());
+        let primaries: Vec<NodeId> = {
+            guards.choose(&dir, &last, &[]).unwrap();
+            guards.list().into_iter().map(|g| g.identity).collect()
+        };
+        assert_eq!(primaries.len(), 2);
         for _ in 0..20 {
-            match guards.choose(&dir, &last, &[]) {
-                Ok(g) => guards.mark_failed(&g.node_id),
-                Err(e) => {
-                    assert!(matches!(e, NetError::NoGuard(_)), "{e}");
-                    break;
-                }
-            }
+            let g = guards.choose(&dir, &last, &[]).unwrap();
+            assert!(primaries.contains(&g.node_id), "a new guard was used");
+            guards.mark_failed(&g.node_id);
         }
-        assert_eq!(guards.list().len(), 2, "only the primaries were ever tried");
-        assert!(guards.choose(&dir, &last, &[]).is_err());
+        assert_eq!(guards.list().len(), 2, "no guard was added");
+        // The retries alternate: the guard that failed longest ago first.
+        let a = guards.choose(&dir, &last, &[]).unwrap();
+        guards.mark_failed(&a.node_id);
+        let b = guards.choose(&dir, &last, &[]).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_restarted_guard_works_again_at_once() {
+        // Regression (found while debugging v0.7): a guard that failed once
+        // (its relay crashed) stayed unusable for the whole retry period,
+        // even after the relay came back, when it was the only guard.
+        let entry = relay("only-entry", Role::Entry, 100, "fa");
+        let last = relay("rv", Role::Rendezvous, 200, "frv");
+        let dir = Directory::from_descriptors(vec![entry.clone(), last.clone()]).unwrap();
+        let guards = Guards::ephemeral(config()); // retry_after: 10 minutes
+        assert_eq!(guards.choose(&dir, &last, &[]).unwrap(), entry);
+        guards.mark_failed(&entry.node_id);
+        assert_eq!(guards.choose(&dir, &last, &[]).unwrap(), entry, "retried");
     }
 
     #[test]
@@ -688,6 +781,42 @@ mod tests {
         assert!(Guards::persistent(&path, "othernet", config()).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(Guards::persistent(&path, "testnet", config()).is_err());
+    }
+
+    #[test]
+    fn guards_unlisted_for_too_long_are_dropped() {
+        // Found while debugging v0.7: after relays were recreated with new
+        // identities, the sample stayed full of dead guards for weeks.
+        let (old, last) = net(3);
+        let guards = Guards::ephemeral(GuardConfig {
+            max_sampled: 2,
+            remove_unlisted_after: Duration::from_secs(1),
+            ..config()
+        });
+        guards.choose(&old, &last, &[]).unwrap();
+        // The testnet is rebuilt: every relay has a new identity.
+        let (rebuilt, new_last) = net(3);
+        let err = guards
+            .choose(&rebuilt, &new_last, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not listed"), "{err}");
+        std::thread::sleep(Duration::from_millis(2100));
+        let guard = guards.choose(&rebuilt, &new_last, &[]).unwrap();
+        assert!(rebuilt.find(&guard.node_id).is_some());
+        assert!(
+            guards
+                .list()
+                .iter()
+                .all(|g| rebuilt.find(&g.identity).is_some())
+        );
+        // A guard that comes back before the limit is kept.
+        let keep = Guards::ephemeral(config());
+        keep.choose(&old, &last, &[]).unwrap();
+        let before = keep.list();
+        let _ = keep.choose(&rebuilt, &new_last, &[]);
+        keep.choose(&old, &last, &[]).unwrap();
+        assert_eq!(keep.list()[..2], before[..]);
     }
 
     #[test]

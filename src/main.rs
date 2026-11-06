@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
-/// Usage: mask-browser [ADDRESS]
-/// ADDRESS may be a website (https://…) or a morp://<id>.morp address.
+/// Usage: `mask-browser [ADDRESS]`
+/// `ADDRESS` may be a website (`https://…`) or a `morp://<id>.morp` address.
 ///
 /// Environment: MASK_NETWORK (testnet), MASK_MORP_ONLY=1 (refuse all
 /// websites), MASK_STATE_DIR (entry guards), MASK_KEEP_TIMEZONE=1 (do not

@@ -54,7 +54,7 @@ struct Args {
     #[arg(long)]
     name: Option<String>,
 
-    /// Where the identity key is kept. Defaults to runtime/relays/<name>
+    /// Where the identity key is kept. Defaults to `runtime/relays/<name>`
     /// (local mode) or the data_dir in relay.toml.
     #[arg(long)]
     data_dir: Option<PathBuf>,

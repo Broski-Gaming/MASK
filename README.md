@@ -286,10 +286,15 @@ docs/                      MORP, addresses, hidden services, distributed network
 - The browser prints MORP errors in the terminal; set `RUST_LOG=debug` for more.
 - **Key file refused**: `chmod 600` the `identity.key` or `service.key` named
   in the error.
-- **"no usable entry guard: all … entry guard(s) are unreachable"** (v0.7):
-  every entry relay this client uses is down. MASK deliberately does not pick
-  new ones; start the entry relay again, or delete the guard file named in
-  the docs to choose new guards.
+- **"relay circuit failed: … Connection refused"** while a relay is down: if
+  it is this client's entry guard, MASK keeps retrying that same guard (and
+  works again as soon as it is back) but deliberately never switches to other
+  entry relays because of failures. Start the entry relay again.
+- **"no usable entry guard: … is not listed"** (v0.7): this client's guards
+  are no longer in the relay list (for example the relays were recreated
+  with new identities). Unlisted guards are dropped after 7 days; to choose
+  new guards now, delete the guard file (`runtime/state/*-guards-*.json`, or
+  `service-guards-*.json` next to a service key).
 - **"Blocked: a .morp page tried to open the website …"** (v0.7): links from
   `.morp` pages to websites are not followed (websites see your IP address).
   Type the address yourself if you mean to open it.

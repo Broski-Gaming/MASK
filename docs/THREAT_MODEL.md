@@ -127,7 +127,7 @@ and volume. An entry learns the client's IP; a rendezvous point learns that
 some client and some service are talking. A relay can always drop traffic
 (denial of service). Selective denial of service — killing circuits it
 cannot correlate so that clients rebuild through relays it controls — is
-limited by guards and by "never sample new guards while all are down", but
+limited by guards and by "never sample new guards because of failures", but
 not eliminated.
 
 ### 4.3 Sybil attacks and coordinated identities (A4)

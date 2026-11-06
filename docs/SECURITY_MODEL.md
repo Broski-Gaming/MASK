@@ -76,9 +76,13 @@ Implemented in `crates/mask-net/src/guards.rs` and `client.rs`.
 - New guards prefer entry relays listed for at least
   `guard_min_listed_secs` (default **1 h**), then relays in a family,
   operator, and /16 not already among the guards.
-- **Fail closed**: with every sampled guard down, no new guard is sampled;
-  a circuit whose last hop is related (same family or operator) to every
-  usable guard is refused (`NetError::NoGuard`).
+- **Fail closed**: failures never cause new guards to be sampled. With
+  every usable guard failing, the client retries the one that failed
+  longest ago (so a restarted relay works again at once) and the circuit
+  fails if it is still down. A circuit whose last hop is related (same
+  family or operator) to every usable guard is refused
+  (`NetError::NoGuard`). Guards missing from the relay list for 7 days are
+  dropped (freeing their place in the sample; Tor uses 20 days).
 - Path = guard → middle → last. The guard is never related to the last hop.
   Middles are chosen in tiers: unrelated to both ends and on another /16;
   unrelated; healthy; any.

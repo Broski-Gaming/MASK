@@ -1058,13 +1058,14 @@ async fn when_its_guards_are_down_a_client_fails_closed() {
     let (_, route) = client.connect(&address).await.unwrap();
     assert_eq!(route.entry, sampled[1]);
 
-    // Both are gone: no circuit, and the third entry relay is never tried.
+    // Both are gone: no circuit, and the third entry relay is never tried
+    // (the client retries its own guards, which refuse; it picks no new one).
     net.relay(&sampled[1]).handle.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
     client.close_all();
     net.log.lock().unwrap().clear();
     let err = client.connect(&address).await.err().expect("must fail");
-    assert!(err.to_string().contains("guard"), "{err}");
+    assert!(err.to_string().contains("circuit failed"), "{err}");
     let spare = THREE_ENTRIES
         .iter()
         .find(|s| s.role == Role::Entry && !sampled.iter().any(|n| n == s.nick))
