@@ -1,11 +1,11 @@
-# MORP Hidden Services (v0.5, experimental)
+# MORP Hidden Services (v0.5–v0.7, experimental)
 
 > **Status: experimental, unreviewed.** One machine, or a private testnet
 > (v0.6, see `docs/DISTRIBUTED_NETWORK.md`), where descriptors are stored at
 > the directory authorities and all links are Noise-encrypted.
 > Every `.morp` connection now travels through MORP relay circuits, and
 > service descriptors no longer contain a network location. This is **not**
-> Tor-level anonymity: the network is a handful of relays on one computer,
+> Tor-level anonymity: the network is a handful of relays run by one operator,
 > the design has not been independently reviewed, and the limitations below
 > are significant. Do not rely on it to protect anyone.
 
@@ -187,26 +187,28 @@ periods); links with no circuits close after the idle timeout.
 
 ### Not protected against
 
-- **Everything is on one machine.** All relays, the directory, the client,
-  and the service share 127.0.0.1. Locally, "location hiding" means only that
-  the descriptor and protocol do not reveal the service's port; anyone with
-  access to the machine can see every process and socket.
-- **Small network.** With one entry, one middle, and two rendezvous relays,
-  a single operator controls every hop. Real anonymity needs many
-  independent relays.
+- **One machine or one small LAN, one operator.** In local mode all relays,
+  the directory, the client, and the service share one machine: "location
+  hiding" means only that the descriptor and protocol do not reveal the
+  service's port. On the v0.6 testnet one operator still runs every relay.
+- **Small network.** A few relays run by one person cannot provide real
+  anonymity; that needs many independent relays.
 - **Traffic analysis.** Variable cell sizes, no padding, no cover traffic.
   An observer of both ends (or a colluding entry on each side) can correlate
   timing and volume.
-- **Unauthenticated, unencrypted links.** Relay-to-relay links are plain TCP
-  (see `docs/MORP.md`): link observers see sizes and timing and can cut
-  circuits. Cell contents remain encrypted.
-- **No guard relays, no path diversity rules, no families.** Repeated
-  circuits through attacker relays are not prevented.
-- **Directory trust and privacy.** The directory is a single server that sees
-  every lookup. Descriptors are signed but not encrypted (Tor v3 encrypts
-  them and blinds keys so directories cannot enumerate services).
-- **Denial of service.** Intro points can be flooded with introductions;
-  there is no proof-of-work or rate limiting beyond simple caps.
+- **Links** are Noise-encrypted and authenticated since v0.6; observers
+  still see endpoints, sizes, and timing and can cut circuits.
+- **Guards and diversity (v0.7)** limit, but do not prevent, repeated use of
+  attacker relays: clients and services use persistent entry guards never
+  related to the last hop, but families and operators are only as honest as
+  the allowlist.
+- **Directory trust and privacy.** The directory (or authority) sees every
+  lookup. Descriptors are signed but not encrypted (Tor v3 encrypts them and
+  blinds keys so directories cannot enumerate services).
+- **Denial of service.** Since v0.7 introductions are rate-limited at each
+  intro point and at the service, and rendezvous builds are capped; an
+  attacker who exhausts those budgets still blocks honest clients for a
+  while. There is no proof-of-work.
 - **Intro point loss.** Since v0.6 a host that loses an intro circuit builds
   a new intro point at another rendezvous-role relay and republishes its
   descriptor; clients holding the old descriptor may fail once until they
@@ -228,7 +230,28 @@ periods); links with no circuits close after the idle timeout.
 | Requests in flight per session | 64 |
 | Response size | ≤ 16 MiB |
 | Concurrent sessions per service | 64 |
-| Replay cache per service run | 100 000 introductions |
+| Rendezvous circuits being built at once (v0.7) | 16 |
+| Introductions per intro point (v0.7) | 16 384, then the intro point is replaced with fresh keys (each intro point has its own replay cache) |
+| Introductions processed by a service (v0.7) | 10/s, burst 64 |
+| `Introduce1` per intro point at the relay (v0.7) | 8/s, burst 64 |
+| Response bytes announced per session (v0.7) | ≤ 64 MiB |
+
+## 7a. Changes in v0.7
+
+- **Replay caches per intro point, with rotation.** v0.5-v0.6 kept one
+  service-wide cache of 100 000 client keys and, when it was full, refused
+  every introduction until restart: anyone could fill it with valid
+  introductions and take the service offline. Now each intro point
+  remembers what it accepted and is retired at its limit; the host replaces
+  it and republishes (as for a lost intro point).
+- Introductions are decrypted and replay-checked one at a time per intro
+  point, behind a rate limit; only good ones start a rendezvous.
+- Entry guards for services (kept next to the service key), and intro
+  points / rendezvous circuits never related to the guard.
+- Isolation contexts in `MorpClient` (separate sessions and circuits per
+  browser identity), and "New identity" in the browser.
+- Client: intro circuits reuse the rendezvous link only when its guard may
+  be used with that intro relay.
 
 ## 8. Running it
 

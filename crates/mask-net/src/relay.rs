@@ -552,14 +552,21 @@ impl Inner {
     }
 
     async fn handle_inbound(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
+        // Safe logging (v0.7): an entry relay's peers are clients, and a log
+        // of client addresses is exactly what an entry must not keep. Peer
+        // addresses appear only at debug level, or when a connection is
+        // refused as abuse (operators need those).
         debug!(%peer, "inbound connection");
         match self.serve_inbound(stream, peer).await {
-            Ok(()) => info!(%peer, "inbound link closed"),
+            Ok(()) => debug!(%peer, "inbound link closed"),
             Err(e @ (NetError::Untrusted(_) | NetError::Crypto(_))) => {
                 bump(&self.counters.links_refused);
                 warn!(%peer, error = %e, "refused link");
             }
-            Err(e) => warn!(%peer, error = %e, "inbound link closed with error"),
+            Err(e) => {
+                info!(error = %e, "inbound link closed with an error");
+                debug!(%peer, error = %e, "inbound link closed with an error");
+            }
         }
     }
 

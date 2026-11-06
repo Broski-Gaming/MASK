@@ -2,9 +2,11 @@
 
 > **Status: experimental, unreviewed. One machine, or a private testnet of
 > machines you control (never public addresses).** Sections 1–10 describe
-> the circuit protocol (unchanged since v1 except where noted); §11 and §12
-> list what versions 2 and 3 changed. Multi-machine operation is described
-> in `docs/DISTRIBUTED_NETWORK.md`.
+> the circuit protocol (unchanged since v1 except where noted); §11–§13
+> list what versions 2 and 3 and MASK v0.7 changed. Multi-machine operation
+> is described in `docs/DISTRIBUTED_NETWORK.md`; the current threat model
+> and security mechanisms in `docs/THREAT_MODEL.md` and
+> `docs/SECURITY_MODEL.md` (they supersede §8–§10 where they differ).
 > MORP has not been independently reviewed or analysed. It must not be used
 > to protect anyone's identity, communications, or safety. This document
 > describes what it is designed to do and, just as importantly, what it does
@@ -305,9 +307,8 @@ handshake, response, and idle timeouts.
 
 - Network scope `loopback` (default) or `private`; public addresses are
   always refused for listening, advertising, extending, and accepting.
-- Exactly three hops with fixed roles; path selection prefers three
-  different families and avoids recently failed relays, but there are no
-  guard nodes or bandwidth weighting.
+- Exactly three hops with fixed roles; entry guards and family/operator/
+  network diversity since v0.7 (§13), but no bandwidth weighting.
 - One outstanding request per circuit; no streams or flow control.
 - Onion keys rotate only when a relay restarts; descriptors have no expiry.
 - Error details reveal relay names (debugging aid).
@@ -317,9 +318,10 @@ handshake, response, and idle timeouts.
 
 At minimum: an independent cryptographic and protocol review; fixed-size
 cells with padding; consensus documents agreed and signed by several
-independent authorities; guard selection; fuzzing of all parsers; and a
+independent authorities; coverage-guided fuzzing of all parsers; and a
 removal of debugging detail from errors. (Authenticated, encrypted links
-were added in version 3.) Until then, MASK must not be described as anonymous or secure.
+were added in version 3; entry guards in v0.7.) Until then, MASK must not
+be described as anonymous or secure.
 
 ---
 
@@ -362,3 +364,31 @@ were added in version 3.) Until then, MASK must not be described as anonymous or
 - Paths choose the entry and middle together, preferring three distinct
   families, and skip relays that failed in the last 60 s; circuit builds are
   retried on fresh paths.
+
+## 13. Changes in MASK v0.7 (still MORP version 3)
+
+The link and cell formats are unchanged (`MORP_VERSION` stays 3). What
+changed is how strictly both ends treat them, and the directory formats:
+
+- **Ciphers** refuse all further use after one failed `open`, and are
+  locked to one job (seal or open) by their first use (§6).
+- **Clients destroy circuits** on any undecryptable or undecodable cell,
+  unexpected message, or command from an intermediate hop other than
+  `Error`; every later call fails with `Destroyed`. A circuit whose receive
+  queue stays full for 2 s is destroyed instead of stalling its link.
+- **Relays** treat a backward cell on a circuit that is not open (before
+  `CREATED`) as a protocol violation and destroy the circuit (it used to be
+  dropped silently). They count protocol violations, rate-limit CREATEs per
+  client IP (client links at entries only) and `Introduce1` per intro
+  point, and never log message contents or (at the default level) client
+  addresses.
+- **Remote error text** is stripped of control and bidi characters and
+  capped at 300 characters before it is shown or logged.
+- **Consensus format 2** (`"MORP-v3 consensus v2\0"`): each entry carries
+  the relay's descriptor plus the authority-assigned operator and listing
+  time; clients reject shared identities/nicknames/addresses/keys, lifetimes
+  over 24 h, and listings in the future. Directory protocol version 2.
+- **Entry guards** and **path diversity** (`guards.rs`, `client.rs`): the
+  entry is always one of the client's persistent guards and never in the
+  last hop's family or operator; middles avoid both ends' family, operator,
+  and /16. See `docs/SECURITY_MODEL.md` §4.

@@ -33,14 +33,16 @@ pub const HTML: &str = r#"<!DOCTYPE html>
 <body>
 <main>
   <h1>MASK</h1>
-  <p class="version">Multi-hop Anonymous Service Kit · v0.5 development build</p>
+  <p class="version">Multi-hop Anonymous Service Kit · v0.7 development build</p>
   <p>Type a website (<code>https://…</code>) or a cryptographic <code>morp://&lt;id&gt;.morp</code> address above.</p>
   <div class="warning">
     <strong>Not anonymous.</strong> Websites are loaded directly over your normal
-    internet connection. <code>.morp</code> services are found through the local MORP
-    directory (never public DNS), must prove they own their address, and are
-    reached only through MORP relay circuits. This is an unreviewed experiment
-    running on this computer, not Tor-level anonymity. Cookies and site data are discarded when the window closes.
+    internet connection and see your IP address. <code>.morp</code> services are found
+    through the MORP directory (never public DNS), must prove they own their address,
+    and are reached only through MORP relay circuits; while a <code>.morp</code> page is
+    open, the browser makes no direct connection at all. This is an unreviewed
+    experiment on a small private network, not Tor-level anonymity. Cookies and site
+    data are discarded when the window closes.
   </div>
 </main>
 </body>

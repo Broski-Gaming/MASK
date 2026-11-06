@@ -358,3 +358,94 @@ help.
   entry guards, fixed-size cells and padding, circuit-routed descriptor
   lookups, encrypted/blinded descriptors, introduction rate limits, browser
   circuit status panel, fuzzing, and an external review.
+
+## v0.7 — Security and anonymity hardening (2026-11-05)
+
+**Result: implemented and verified on one machine** (unit and integration
+tests, separate processes, network namespaces with packet capture, and the
+real browser against hostile pages). Unreviewed; not Tor-level anonymity.
+Threat model: `docs/THREAT_MODEL.md`. Mechanisms, limits, and the browser
+fingerprinting audit: `docs/SECURITY_MODEL.md`.
+
+**Starting point.** v0.6 re-verified first (commit `b9919d3`, clean tree):
+fmt clean, clippy 0 warnings, 194 tests passing, `netns` test passing.
+
+**Milestones** (branch `v0.7-hardening`, one commit each)
+
+| # | Milestone | Main changes |
+|---|---|---|
+| M1 | Circuit hardening, abuse limits | poisoned/one-job ciphers; clients destroy circuits on any bad or out-of-place cell; relays refuse cells before CREATED; sanitized remote text; bounded per-circuit queues; CREATE and Introduce1 rate limits; per-intro-point replay caches with rotation; session quota; authority per-IP limit; directory client under the connection policy |
+| M2 | Coordinated identities, hostile directories | family (required) and operator bound in the allowlist; copycat (shared address/keys) and per-IP refusals; listing history; consensus format 2 with client-side uniqueness, lifetime, and time checks |
+| M3 | Entry guards, path diversity | `guards.rs` (2 primary / 5 sampled, 30-60 days, fail closed, private per-network files); guard never related to the last hop; diversity tiers for middles; guards in CLI, browser, and services |
+| M4 | Circuit isolation | `IsolationContext` in `MorpClient` |
+| M5 | Browser leak prevention, fingerprinting | content rules (FFI), navigation policy, network gate, MORP-only mode, settings by property name with read-back, fixed UA/language/UTC, permissions denied, New identity, validated service headers, no address logging; live leak test |
+| M6 | Packet capture, fail closed | tcpdump checks in `netns-testnet.sh`, black-holed routes, blocked-connection test |
+| M7 | Documentation | `THREAT_MODEL.md`, `SECURITY_MODEL.md`, MORP/DISTRIBUTED/HS docs, README, CLAUDE.md, safe relay logging |
+
+**Security issues found and fixed** (each with a regression test; ✓ = test
+verified to fail with the fix removed)
+
+| Issue | Found by | Fix | Test |
+|---|---|---|---|
+| **WebKit pre-connects to a clicked link's host before the navigation policy runs**, so a `.morp` page could make the browser open a direct TCP connection to any website (revealing the user's IP) | live browser leak test (phase-tagged canary connections) | network gate: black-hole proxy while a `.morp` page is shown | `browser_leaks` ✓ |
+| `load_uri` pre-connects even when the policy then refuses (MORP-only mode) | same | typed URLs checked before WebKit sees them; gate sealed in MORP-only mode | `browser_leaks` |
+| A relay could publish another relay's address and link key and be listed (the real relay answered the probes) | code review | authority refuses shared address/link/onion key; clients reject such consensuses | `relay_borrowing_…` ✓ |
+| Families were self-declared: one machine could pose as several | review | family bound in `approved-relays.toml` | `approved_relay_claiming_…` |
+| Service-wide replay cache: once full (100 000 valid introductions), the service refused **every** introduction until restart | review | per-intro-point caches, rotation at a limit | `intro_point_rotates_…` |
+| A hostile service could make a client buffer up to 1 GiB (64 × 16 MiB) | review | 64 MiB announced-bytes quota per session | `hostile_service_cannot_make_…` |
+| A circuit that failed to decrypt stayed usable on the client | review | cipher poisoning; client destroys the circuit | `garbage_backward_cell_…` ✓ |
+| A middle relay could answer for the last hop (protocol error, circuit kept) | review | violation destroys the circuit | `intermediate_hop_cannot_…` |
+| Cells before CREATED were dropped silently (client waited for a timeout) | review | protocol violation, circuit destroyed | `next_hop_sending_cells_…` ✓ |
+| One unread circuit stalled every circuit on its link forever | review | 2 s bounded wait, then the circuit is destroyed | `a_flooded_circuit_…` ✓ |
+| Circuit IDs could be reused under a live circuit after a route was dropped (latent) | review | IDs stay reserved until the circuit is dropped | covered by the flood test |
+| Remote error text could carry terminal escapes / fake log lines / bidi overrides | review | `sanitize_remote_text` everywhere remote text enters | `hostile_error_text_…`, unit |
+| An invalid content type from a service panicked the browser's handler task (page hung); 1xx statuses passed through | review | validated status and content type | `hostile_status_and_content_type_…` |
+| The browser logged every visited `.morp` address on failure | review | address no longer logged | (log policy) |
+| Entry relays logged client IP addresses at info/warn level | review | peer addresses only at debug (abuse refusals excepted) | netns log check ✓ |
+| The local directory client bypassed the connection policy and read unbounded answers | review | policy check, 64 KiB limit | (unit/integration paths) |
+| No per-IP limit at the authority; no rate limits at relays or services | review | token buckets, per-IP slots | `hostile.rs` rate-limit tests |
+| Session request IDs could collide after 2³² requests (latent) | review | skip IDs in flight | — |
+
+Bugs in the new test tooling, fixed along the way: tcpdump in a user
+namespace needs `-Z root` for reading too (the first capture analysis read
+nothing and would have passed vacuously; the scripts now fail on an empty
+capture), and a `set -e` exit in the guard-address helper.
+
+**Verification**
+
+| Check | Evidence | Result |
+|---|---|---|
+| `cargo fmt --check`, `cargo check`, `cargo clippy --workspace --all-targets` | clean, 0 warnings | Pass |
+| `cargo test --workspace` | **249 passed, 0 failed**, 2 opt-in: 32 browser unit, 132 network unit, 32 MORP, 20 hidden-service, 9 hostile, 3 malicious-relay, 20 testnet, 1 multi-process | Pass |
+| Stability | testnet, hostile, hidden_services, morp, malicious_relays: 10 consecutive runs each, 0 failures | Pass |
+| Network namespaces (`scripts/netns-testnet.sh`) | **22 checks passed**, incl. 684-packet LAN capture: no DNS packet, no cli↔svc packet, cli and svc connect only to the authority and their own guards (guard files 0600), no plaintext content/requests/address on the wire, no client/service IP in relay logs, black-holed entry routes → "no usable entry guard" | Pass |
+| Browser leak test (`scripts/browser-leak-test.sh`) | real MASK Browser in a namespace whose only resolver is a DNS canary (positive control passes); hostile `.morp` page: no internet-canary connection, no DNS lookup, no STUN packet, navigation away blocked; hostile clearnet page: no `morp:` load, no `.morp` DNS lookup; MORP-only mode: typed website not contacted; 414-packet capture: everything on loopback, no UDP besides DNS | Pass |
+| What a `.morp` page sees | WebRTC undefined, WebGL false, WebAudio undefined, no getUserMedia, TZ UTC, `en-US`, fixed UA; real screen size and core count (documented as not protected) | as designed |
+| Mutation checks | removing: cipher poisoning + client kill, cells-before-CREATED rule, bounded queue wait, copycat refusal, network gate, safe logging → the corresponding test fails | Pass |
+| Multi-process testnet | guard file 0600 written by `fetch`, `verify` reused one of its guards, host keeps separate guards | Pass |
+
+**Limitations that remain (not solvable by local testing)** — see
+`docs/THREAT_MODEL.md` §4-§5:
+- no padding or cover traffic; traffic correlation and website
+  fingerprinting are not resisted; no claim against global adversaries;
+- one authority (no threshold signatures); the authority sees descriptor
+  lookups; descriptors are not blinded;
+- one operator runs every relay; families/operators are only as honest as
+  the allowlist;
+- clearnet websites are loaded directly in normal mode;
+- screen/window size, CPU cores, fonts, canvas, CSS media features are not
+  normalised;
+- no coverage-guided fuzzing (random/mutated-input decoder tests only), no
+  independent review.
+
+**Compatibility.** v0.7 changes the consensus format (2) and the directory
+protocol (2), and `approved-relays.toml` now requires `family`: upgrade
+every machine together; v0.6 nodes refuse v0.7 directory answers cleanly.
+
+## Next
+
+- LAN trial on the PC and the Chromebook with v0.7 (`docs/DISTRIBUTED_NETWORK.md` §4-§5).
+- Then: multiple authorities with threshold signatures, circuit-routed and
+  blinded descriptor lookups, fixed-size cells and padding, coverage-guided
+  fuzzing (`cargo fuzz`) of every decoder, window-size letterboxing, and an
+  external review.

@@ -2,7 +2,7 @@
 
 An experimental privacy browser and onion-routing network, written in Rust.
 
-> **Status: v0.6 development build. MASK is not anonymous and has not been
+> **Status: v0.7 development build. MASK is not anonymous and has not been
 > security reviewed.** Normal websites are loaded directly over your internet
 > connection. `.morp` hidden services are reached only through MORP relay
 > circuits, on one computer or on a private testnet of machines you control
@@ -19,6 +19,15 @@ An experimental privacy browser and onion-routing network, written in Rust.
 - Opens cryptographic `morp://<id>.morp` hidden services through MORP relays
 - Rejects other schemes (`file:`, `javascript:`, `data:`, ...) and named `.mask` addresses
 - Ephemeral session: cookies, cache, and site storage are discarded on exit
+- Leak prevention (v0.7): `.morp` pages can load only from their own service and
+  cannot send you to a website; no page can load `morp:` from the clearnet or
+  look up a `.morp` name in DNS; while a `.morp` page is open, the browser makes
+  no direct connection at all (network gate); WebRTC, WebGL, WebAudio, media
+  capture, and permission requests are off; fixed user agent, `en-US`, UTC
+- **New identity** button: new MORP circuits for every service, all site data cleared
+- **MORP-only mode** (`MASK_MORP_ONLY=1`): every website is refused
+- Details and remaining fingerprinting surfaces: [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md);
+  threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 
 **`.morp` hidden services (v0.5)** — [docs/MORP_HIDDEN_SERVICES.md](docs/MORP_HIDDEN_SERVICES.md)
 - Addresses are derived from Ed25519 keys (56 characters + `.morp`); no names, aliases, or DNS
@@ -46,6 +55,17 @@ An experimental privacy browser and onion-routing network, written in Rust.
   keepalives, connection limits, family-aware paths, intro-point recovery
 - Tested with multiple processes and Linux network namespaces
   (`scripts/netns-testnet.sh`)
+
+**Hardening (v0.7)**
+- Persistent entry guards; paths never put the entry and last hop in one family
+  or operator, and middles avoid both ends' family, operator, and network
+- Relay families and operators bound in the allowlist; relays copying another
+  relay's address or keys refused; relays per IP capped; consensus format 2
+- Circuits destroyed on any bad or out-of-place cell; ciphers refuse reuse after
+  a failure and can only seal or only open; rate limits for circuit creation and
+  introductions; per-intro-point replay caches; session and connection quotas
+- Scripted hostile-relay tests, packet captures in network namespaces, and a
+  live browser leak test with DNS, HTTP, and STUN canaries
 
 ## Install
 
@@ -121,7 +141,13 @@ only Rust.
 ```sh
 cargo run                         # start page
 cargo run -- https://example.com  # open an address directly
+MASK_MORP_ONLY=1 cargo run        # refuse every website, allow only morp://
 ```
+
+Environment variables: `MASK_NETWORK` (testnet `network.toml`),
+`MASK_MORP_ONLY=1`, `MASK_STATE_DIR` (the browser's entry guards, default
+`runtime/state`), `MASK_KEEP_TIMEZONE=1` (do not report UTC to pages),
+`MASK_DIRECTORY` / `MASK_RELAY_DIRECTORY` (local mode).
 
 ## Host a hidden `.morp` website
 
@@ -166,6 +192,9 @@ cargo run -p mask-net --bin mask-service -- host <address> --app 127.0.0.1:8080 
 - Relays keep their identity keys in `runtime/relays/` and publish
   descriptors to `runtime/directory/`, which the host and browser read.
 - Stopping a host (Ctrl+C or `stop`) withdraws its descriptor.
+- Entry guards (v0.7) are kept in private files: `runtime/state/` for
+  `fetch`/`verify` (`--state-dir`) and the browser, and next to each service
+  key for hosts. Deleting a guard file makes that component choose new guards.
 - The service directory keeps descriptors in memory; if you restart it,
   restart your hosts too. If a relay used as an intro point stops, the host
   builds a new intro point at another rendezvous relay and republishes.
@@ -188,7 +217,9 @@ cargo run -p mask-net --bin mask-client -- -m "hello MASK" --circuits 2
 cargo fmt --all
 cargo check
 cargo clippy --workspace --all-targets
-cargo test                # browser and network tests
+cargo test --workspace            # browser and network tests
+scripts/netns-testnet.sh          # testnet in network namespaces + packet capture (no root)
+scripts/browser-leak-test.sh      # real browser vs hostile pages, DNS/HTTP/STUN canaries (needs a desktop)
 ```
 
 ## Project layout
@@ -199,7 +230,9 @@ src/                       browser
   main.rs                  entry point
   address.rs               address bar parsing and validation
   morp.rs                  morp:// handler (relay-routed, no DNS, fails closed)
-  browser/                 window, toolbar, theme, start page
+  privacy.rs               leak-prevention and anti-fingerprinting policy (content rules, navigation)
+  browser/                 window, toolbar, theme, start page, content filter, network gate
+tests/browser_leaks.rs     the real browser against hostile pages (opt-in: --ignored)
 crates/mask-net/           network (no GUI dependencies)
   src/
     address.rs             .morp address format and validation
@@ -208,6 +241,8 @@ crates/mask-net/           network (no GUI dependencies)
     directory/             localhost service directory (server + client)
     authority/             directory authority, signed consensus, authority client
     trust.rs               trusted relay set (folder or consensus), identity pins, health
+    guards.rs              persistent entry guards
+    limits.rs              rate limits (token buckets)
     scope.rs               allowed addresses (loopback / private, never public)
     config.rs              TOML configuration files
     crypto/                relay keys, ntor-style handshake, layer encryption
@@ -220,13 +255,16 @@ crates/mask-net/           network (no GUI dependencies)
   tests/morp.rs            relay routing, failure, and tampering tests
   tests/hidden_services.rs hidden-service routing, no-bypass, auth, failure, cleanup tests
   tests/malicious_relays.rs on-path tampering and black-holing relay tests
+  tests/hostile.rs         scripted hostile relays, flooding, rate limits
   tests/testnet.rs         network-mode testnet in one process (authority, consensus, failures)
   tests/processes.rs       the real binaries as separate processes with TOML configs
   tests/netns.rs           runs scripts/netns-testnet.sh (opt-in: --ignored)
 deploy/                    example network/relay/authority configs, systemd units, nftables
-scripts/netns-testnet.sh   testnet across Linux network namespaces (no root)
+scripts/netns-testnet.sh   testnet across Linux network namespaces + packet capture (no root)
+scripts/browser-leak-test.sh browser leak test in an isolated namespace
 examples/morp-site/        example website
-docs/                      MORP, addresses, hidden services, distributed network, progress notes
+docs/                      MORP, addresses, hidden services, distributed network, threat and
+                           security models, progress notes
 ```
 
 ## Troubleshooting
@@ -248,3 +286,12 @@ docs/                      MORP, addresses, hidden services, distributed network
 - The browser prints MORP errors in the terminal; set `RUST_LOG=debug` for more.
 - **Key file refused**: `chmod 600` the `identity.key` or `service.key` named
   in the error.
+- **"no usable entry guard: all … entry guard(s) are unreachable"** (v0.7):
+  every entry relay this client uses is down. MASK deliberately does not pick
+  new ones; start the entry relay again, or delete the guard file named in
+  the docs to choose new guards.
+- **"Blocked: a .morp page tried to open the website …"** (v0.7): links from
+  `.morp` pages to websites are not followed (websites see your IP address).
+  Type the address yourself if you mean to open it.
+- **"family is required"** (v0.7): add `family = "<machine label>"` to each
+  relay in `approved-relays.toml` (`mask-relay --print-identity` prints it).

@@ -48,8 +48,9 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::crypto::keys::{create_private_dir, read_secret, write_new_secret};
 use crate::identity::Role;
 
-/// Directory protocol version (checked on every request).
-pub const DIR_PROTOCOL_VERSION: u16 = 1;
+/// Directory protocol version (checked on every request). v0.7: 2 (status
+/// answers carry operators and listing ages; consensus format 2).
+pub const DIR_PROTOCOL_VERSION: u16 = 2;
 /// Default authority port.
 pub const DEFAULT_AUTHORITY_PORT: u16 = 7300;
 

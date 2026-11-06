@@ -223,6 +223,12 @@ if grep -q "Hello across" entry1.log entry2.log middle1.log middle2.log rv1.log 
 else
     pass "no relay or authority log contains page content"
 fi
+# v0.7 safe logging: entry relays never log their clients' addresses.
+if grep -qE "10\.77\.0\.(30|20)" entry1.log entry2.log middle1.log middle2.log rv1.log rv2.log; then
+    fail "a relay logged the client's or the service's IP address"
+else
+    pass "no relay log contains the client's or the service's IP address"
+fi
 
 if [[ $BROWSER == 1 ]]; then
     info "opening MASK Browser in the cli namespace (close it to continue)"

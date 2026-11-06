@@ -1,4 +1,11 @@
-# MASK v0.6 — Distributed MORP Network (private testnet)
+# MASK v0.6/v0.7 — Distributed MORP Network (private testnet)
+
+> **v0.7 additions** are marked *(v0.7)*: relay families and operators bound
+> in the allowlist, Sybil/copycat refusals, consensus format 2, persistent
+> entry guards, path diversity, rate limits, and packet-capture checks. The
+> threat model and every mechanism are in `docs/THREAT_MODEL.md` and
+> `docs/SECURITY_MODEL.md`. **v0.7 is not compatible with v0.6 binaries**
+> (consensus format 2, directory protocol 2): upgrade every machine.
 
 > **Status: experimental and unreviewed.** v0.6 lets MORP relays, a
 > directory authority, a hidden service, and MASK Browser run on **several
@@ -54,6 +61,11 @@ Every machine gets the **same** `network.toml`, copied by you (USB stick,
 (its Noise key). Nothing is trusted that cannot be traced back to these
 pinned keys. Never download `network.toml` from the network.
 
+*(v0.7)* An optional `[relay_policy]` table sets network-wide numbers that
+the authority and every client apply alike: `max_relays_per_ip` (default 2
+in the private scope, unlimited in loopback) and `guard_min_listed_secs`
+(default 3600: new entry guards prefer relays listed at least this long).
+
 ### Links
 
 Every MORP connection is a Noise session (`docs/MORP.md` §4):
@@ -76,10 +88,14 @@ There is no unencrypted fallback.
 1. A relay uploads its self-signed descriptor (address, role, family, onion
    key, link key) to every authority, at start and every 60 s.
 2. The authority admits it only if the nickname is in
-   `approved-relays.toml` **with the same identity key and role**, the
-   address is inside the network scope, and the timestamp is within the
-   allowed clock skew. A descriptor with an approved nickname but another
-   key is refused as an **identity change** (counted and logged).
+   `approved-relays.toml` **with the same identity key, role, and family**
+   *(family: v0.7)*, the address is inside the network scope, and the
+   timestamp is within the allowed clock skew. A descriptor with an approved
+   nickname but another key is refused as an **identity change** (counted
+   and logged). *(v0.7)* Also refused: a relay using the address, link key,
+   or onion key of another admitted relay (a copycat would otherwise borrow
+   that relay's health probes and be listed), and more than
+   `max_relays_per_ip` relays on one IP address.
 3. The authority probes the relay at its advertised address with a Noise
    handshake against its link key, every `probe_interval_secs` (20 s). Two
    failures in a row take it out of the consensus until it answers again; a
@@ -87,20 +103,32 @@ There is no unencrypted fallback.
 4. Every `consensus_interval_secs` (60 s), and soon after any change, the
    authority signs a consensus: network name, sequence number,
    `valid_after`, `fresh_until`, `valid_until` (600 s), and the running
-   relays' descriptors.
+   relays' descriptors. *(v0.7, format 2)* Each entry also carries the
+   relay's **operator** (from the allowlist) and the time the authority first
+   listed it (kept in `listing-history.json` in its data folder).
 5. Clients, relays, and hosts accept a consensus only if a pinned authority
    signed it, it is for their network, it is not expired (5 min clock skew
    allowed), every descriptor's own signature verifies, and it is **newer
-   than the one they have** (no rollback). They also pin each nickname to
+   than the one they have** (no rollback). *(v0.7)* It must also be valid for
+   at most 24 h, list nobody "in the future", and contain no two relays
+   sharing an identity, nickname, address, onion key, or link key; clients
+   drop relays beyond `max_relays_per_ip`. They also pin each nickname to
    the identity they first saw and refuse changes for as long as they run.
 
 ### Paths
 
 - Circuits are entry → middle → last hop, as before. Relays extend only to
   relays in their consensus, at the published address, inside the scope.
-- The entry and middle are chosen **together** so the three hops come from
-  three different **families** (operator labels, one per machine) whenever
-  the network allows it.
+- *(v0.7)* The entry is always one of the client's **entry guards**: 2
+  primary guards (up to 5 sampled over time), kept for 30-60 days in a
+  private file (`runtime/state/client-guards-<network>.json` for
+  `mask-service fetch/verify`, `browser-guards-…` in `MASK_STATE_DIR` for the
+  browser, `service-guards-…` next to each service key). When all guards are
+  down the client fails closed instead of trying other entry relays.
+- *(v0.7)* The guard is never in the last hop's **family** (machine) or
+  **operator**; the middle prefers a family, operator, and /16 network
+  different from both. MASK-chosen last hops (rendezvous and intro points)
+  avoid the guard's family and operator.
 - A relay that fails while building a circuit is avoided for 60 s and the
   circuit is retried on a fresh path (3 attempts).
 
@@ -127,7 +155,9 @@ entry relays.
 | Circuits | 4096 total, 128 per link | `[limits]` |
 | Handshake / connect timeout | 10 s / 5 s | built in |
 | Idle link without circuits | closed after 300 s | built in |
-| Authority connections | 256; 64 requests each; 30 s idle | built in |
+| Authority connections | 256 (32 per IP, v0.7); 64 requests each; 30 s idle | built in |
+| CREATEs per client IP (entries) *(v0.7)* | 16/s, burst 256 | `create_rate_per_ip`, `create_burst_per_ip` in `[limits]` |
+| Introductions per intro point *(v0.7)* | 8/s, burst 64 | `intro_rate`, `intro_burst` in `[limits]` |
 | Consensus refresh | every 30 s, and early (≤ every 2 s) when a relay is unknown | `consensus_refresh_secs` |
 
 **Shutdown:** `Ctrl+C` or `SIGTERM` (systemd) makes a relay destroy every
@@ -136,8 +166,9 @@ links; the authority drops it after two failed probes. Stop a hidden-service
 host first: it withdraws its descriptor.
 
 **Monitoring:** `mask-authority status --network network.toml` lists every
-relay with role, address, family, whether it is running, probe failures,
-and probe age, plus refused identity changes and unapproved uploads.
+relay with role, address, family, operator *(v0.7)*, whether it is running,
+probe failures, probe age, and how long it has been listed *(v0.7)*, plus
+refused identity changes and unapproved uploads.
 
 ### Network scope
 
@@ -157,6 +188,8 @@ multicast are always refused**; there is no public scope.
 | Someone on the LAN impersonating a relay or the authority | Fails the Noise handshake (pinned / signed keys). |
 | Injecting or altering cells or `Destroy` on a link | Noise authentication fails; the link closes. |
 | A relay rejoining with a new key under an approved name | Refused by the authority (and by clients that saw the old key). |
+| *(v0.7)* One machine posing as several, or a relay copying another's address/keys | Refused: families are bound in the allowlist; shared addresses/keys refused by the authority and rejected by clients. |
+| *(v0.7)* A flood of new entry relays | Existing guards are kept; new guards prefer long-listed relays; at most 5 guards ever sampled. |
 | A machine that is not on the allowlist | Never listed in the consensus; relays refuse its links. |
 | Forged, expired, rolled-back, or other-network consensus | Rejected. |
 | Using a relay to connect to arbitrary hosts | Refused: relays extend only to trusted relays at their published addresses. |
@@ -269,7 +302,9 @@ Print each relay's identity (this creates its `identity.key`, mode 0600):
 
 Send every printed `[[relay]]` block to machine A (they are public keys, not
 secrets) and collect them in `~/morp-testnet/approved-relays.toml` on A
-(see `deploy/approved-relays.toml`).
+(see `deploy/approved-relays.toml`). *(v0.7)* Each block includes the
+relay's `family`; check it is the right machine label, and optionally add
+`operator = "…"` (who runs that machine).
 
 ### 4.6 [A] Start the authority
 
@@ -426,8 +461,29 @@ authority, three relay machines (two relays each), service, and client.
   site must still load.
 - **Shutdown:** finally it sends SIGTERM to everything and requires clean
   exits.
+- *(v0.7)* **Packet capture:** `tcpdump` records everything on the bridge.
+  Checks: no DNS packet at all; not one packet between client and service;
+  client and service open TCP connections only to the authority and their
+  own entry guards (read from their 0600 guard files); page content,
+  requests, and the `.morp` address never appear in clear; no relay log
+  contains the client's or the service's IP address.
+- *(v0.7)* **Fail closed:** the client's routes to every entry relay are
+  black-holed and the fetch must fail ("no usable entry guard") instead of
+  finding another way.
 
 Set `MASK_NETNS_KEEP=1` to keep the logs.
+
+### Browser leak test (one machine, real browser) *(v0.7)*
+
+```sh
+scripts/browser-leak-test.sh
+```
+
+Runs MASK Browser in a namespace whose only network is loopback and whose
+only DNS resolver is a canary (systemd-resolved is hidden: its socket is not
+confined by network namespaces). Hostile `.morp` and clearnet pages try
+every leak a page has; HTTP, STUN, and DNS canaries and a packet capture
+must see nothing escape. See `docs/SECURITY_MODEL.md` §9.
 
 ### On real machines
 
@@ -461,12 +517,13 @@ Follow §4, then:
 
 ---
 
-## 7. Limitations (v0.6)
+## 7. Limitations (v0.7)
 
 - One authority signs alone: no voting or threshold signatures between
   several authorities (each authority signs its own; clients use the
   newest valid one).
-- No entry guards. Clients pick a new entry per circuit.
+- Entry guards exist (v0.7), but with one operator they only help once
+  relays are run by genuinely different people.
 - Descriptor lookups go to the authority directly (over Noise), not through
   a circuit, so the authority learns which addresses an IP asks for.
 - Relay link keys rotate only on restart; the allowlist is reloaded only on
