@@ -121,12 +121,36 @@ pub struct SessionRoute {
     pub intro_point: String,
 }
 
+/// A browsing context (v0.7). Sessions, and so circuits, rendezvous
+/// points, cookies, and links, are never shared between two contexts: a
+/// service (or a relay) cannot tell that requests from two contexts come
+/// from the same client by their circuits. The entry guard *is* shared, as
+/// in Tor: it already knows the client's address.
+///
+/// The browser uses one context per identity and makes a fresh one for
+/// "New identity". Within a context, each `.morp` address has its own
+/// session; pages of one service cannot load another service's resources
+/// (see `src/morp.rs`), so a session only ever carries one first party.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IsolationContext(u64);
+
+impl IsolationContext {
+    /// The context used by [`MorpClient::fetch`].
+    pub const DEFAULT: Self = Self(0);
+
+    /// A context different from every other one in this process.
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// Fetches pages from `.morp` services over relay circuits.
 #[derive(Clone)]
 pub struct MorpClient {
     directory: ServiceDirectory,
     config: Arc<ClientConfig>,
-    sessions: Arc<Mutex<HashMap<MorpAddress, SessionSlot>>>,
+    sessions: Arc<Mutex<HashMap<(IsolationContext, MorpAddress), SessionSlot>>>,
 }
 
 impl MorpClient {
@@ -142,13 +166,25 @@ impl MorpClient {
     }
 
     /// Fetch `request` from the service at `address`, reusing an open
-    /// session when there is one.
+    /// session when there is one (in the default context).
     pub async fn fetch(
         &self,
         address: &MorpAddress,
         request: HttpRequest,
     ) -> Result<HttpResponse, FetchError> {
-        let session = self.session(address).await?;
+        self.fetch_in(IsolationContext::DEFAULT, address, request)
+            .await
+    }
+
+    /// Fetch within `context`: reuses only that context's session for
+    /// `address`, never another context's.
+    pub async fn fetch_in(
+        &self,
+        context: IsolationContext,
+        address: &MorpAddress,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, FetchError> {
+        let session = self.session(context, address).await?;
         session
             .request(request, self.config.request_timeout)
             .await
@@ -163,10 +199,24 @@ impl MorpClient {
         self.sessions.lock().unwrap().clear();
     }
 
-    async fn session(&self, address: &MorpAddress) -> Result<ClientSession, FetchError> {
+    /// Drop `context`'s sessions (closing their circuits once in-flight
+    /// requests finish); other contexts are not touched.
+    pub fn close_context(&self, context: IsolationContext) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|(c, _), _| *c != context);
+    }
+
+    async fn session(
+        &self,
+        context: IsolationContext,
+        address: &MorpAddress,
+    ) -> Result<ClientSession, FetchError> {
+        let key = (context, *address);
         let slot = {
             let mut sessions = self.sessions.lock().unwrap();
-            if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(address) {
+            if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&key) {
                 sessions.retain(|_, slot| {
                     slot.try_lock()
                         .map(|s| s.as_ref().is_some_and(ClientSession::is_open))
@@ -177,7 +227,7 @@ impl MorpClient {
                     sessions.remove(&victim);
                 }
             }
-            Arc::clone(sessions.entry(*address).or_default())
+            Arc::clone(sessions.entry(key).or_default())
         };
         let mut guard = slot.lock().await;
         if let Some(session) = guard.as_ref()

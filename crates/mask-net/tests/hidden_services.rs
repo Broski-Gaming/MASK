@@ -1015,3 +1015,59 @@ async fn service_limits_how_fast_it_accepts_introductions() {
     assert_eq!(stats.introductions_rate_limited.load(Ordering::Relaxed), 1);
     assert_eq!(stats.sessions_started.load(Ordering::Relaxed), 1);
 }
+
+#[tokio::test]
+async fn separate_contexts_never_share_a_session_or_circuit() {
+    use mask_net::hs::client::IsolationContext;
+    let net = Net::start(2).await;
+    let hosted = net.host(1).await;
+    let address = hosted.address();
+    let client = net.client();
+    let stats = hosted.service.stats();
+    let joins = || -> u64 {
+        net.rendezvous
+            .iter()
+            .map(|(_, h)| h.stats().rendezvous_joins)
+            .sum()
+    };
+    let client_links = || {
+        net.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(o, _, ok)| o == "client" && *ok)
+            .count()
+    };
+
+    let a = IsolationContext::fresh();
+    let b = IsolationContext::fresh();
+    assert_ne!(a, b);
+    client.fetch_in(a, &address, get("/")).await.unwrap();
+    client
+        .fetch_in(a, &address, get("/style.css"))
+        .await
+        .unwrap();
+    assert_eq!(
+        stats.sessions_started.load(Ordering::Relaxed),
+        1,
+        "same context, same session"
+    );
+    assert_eq!(joins(), 1);
+    let links_a = client_links();
+
+    client.fetch_in(b, &address, get("/")).await.unwrap();
+    assert_eq!(
+        stats.sessions_started.load(Ordering::Relaxed),
+        2,
+        "a new context gets its own session"
+    );
+    assert_eq!(joins(), 2, "and its own rendezvous");
+    assert!(client_links() > links_a, "and its own link to the guard");
+
+    // Closing one context leaves the other's session alone.
+    client.close_context(b);
+    client.fetch_in(a, &address, get("/app.js")).await.unwrap();
+    assert_eq!(stats.sessions_started.load(Ordering::Relaxed), 2);
+    client.fetch_in(b, &address, get("/")).await.unwrap();
+    assert_eq!(stats.sessions_started.load(Ordering::Relaxed), 3);
+}
