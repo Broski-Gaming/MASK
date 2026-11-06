@@ -1127,3 +1127,76 @@ async fn paths_avoid_a_shared_operator_across_families() {
         );
     }
 }
+
+// ================================================ v0.7: blocked connections
+
+#[tokio::test]
+async fn blocked_morp_connections_fail_closed() {
+    // A local firewall (here: the connection policy) blocks every
+    // connection from the client except to the authority. The client must
+    // fail without contacting anything else and without any fallback.
+    let net = Testnet::start(&THREE_ENTRIES).await;
+    let (service, address, app) = net.host(2).await;
+    let created_before: u64 = net
+        .relays
+        .iter()
+        .map(|r| r.handle.stats().circuits_created)
+        .sum();
+    let attempts: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
+    let policy = {
+        let attempts = Arc::clone(&attempts);
+        let authority = net.authority_addr;
+        ConnectPolicy::new(move |_origin, addr| {
+            attempts.lock().unwrap().push(addr);
+            addr == authority
+        })
+    };
+    let mut config = ClientConfig::new(TrustedRelays::consensus(NetworkScope::Private));
+    config.timeouts = timeouts();
+    config.policy = policy.clone();
+    config.connect_timeout = Duration::from_secs(20);
+    let guards = config.guards.clone();
+    let client = MorpClient::new(
+        AuthorityClient::new(net.network.clone())
+            .with_policy(policy, "client")
+            .with_timeouts(timeouts()),
+        config,
+    );
+    let err = client.connect(&address).await.err().expect("must fail");
+    eprintln!("blocked client: {err}");
+
+    let entries = net.entries();
+    let guard_addrs: Vec<SocketAddr> = guards
+        .list()
+        .iter()
+        .map(|g| {
+            net.relays
+                .iter()
+                .find(|r| r.descriptor.node_id == g.identity)
+                .unwrap()
+                .descriptor
+                .addr
+        })
+        .collect();
+    for addr in attempts.lock().unwrap().iter() {
+        assert!(
+            *addr == net.authority_addr || guard_addrs.contains(addr),
+            "the blocked client tried {addr} (not the authority or one of its guards)"
+        );
+        assert_ne!(*addr, app, "tried the service's app directly");
+    }
+    assert!(
+        attempts.lock().unwrap().iter().any(|a| entries.contains(a)),
+        "the client did try its guard"
+    );
+    let created_after: u64 = net
+        .relays
+        .iter()
+        .map(|r| r.handle.stats().circuits_created)
+        .sum();
+    assert_eq!(
+        created_after, created_before,
+        "no circuit was created anywhere"
+    );
+    assert_eq!(service.stats().sessions_started.load(Ordering::SeqCst), 0);
+}

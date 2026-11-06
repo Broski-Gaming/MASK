@@ -14,9 +14,13 @@
 # svc and cli get routes ONLY to the authority and the two entry relays, so
 # a direct client → service connection is impossible, not just unused.
 #
-# Steps: start everything, fetch the .morp site from cli, cut m2's network
-# cable (no FIN, no warning), check the network routes around it, then stop
-# everything with SIGTERM and check every process exited cleanly.
+# Steps: start everything, fetch the .morp site from cli, check a packet
+# capture of the whole "LAN" (v0.7: no DNS, no cli<->svc packet, cli and svc
+# reach only the authority and their own entry guards, nothing readable on
+# the wire), block cli's routes to every entry relay and check it fails
+# closed, cut m2's network cable (no FIN, no warning), check the network
+# routes around it, then stop everything with SIGTERM and check every
+# process exited cleanly.
 #
 # Usage:
 #   cargo build --workspace
@@ -139,6 +143,34 @@ EOF
 done
 pass "configs written; relay identities approved"
 
+# ------------------------------------------------------- packet capture
+# Everything that crosses the "switch" (the bridge), from here on.
+CAPTURE=0
+if command -v tcpdump >/dev/null; then
+    tcpdump -i br0 -nn -U -Z root -w "$WORK/lan.pcap" >/dev/null 2>"$WORK/tcpdump.err" &
+    PROC_PID[tcpdump]=$!
+    CAPTURE=1
+    sleep 1
+else
+    info "tcpdump not installed: skipping the packet-capture checks"
+fi
+read_pcap() { tcpdump -Z root -nn -r "$1" "${@:2}" 2>/dev/null || true; }
+# Destinations (ip:port) of new TCP connections from one machine.
+syn_targets() {
+    read_pcap "$1" "tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 and src host $2" \
+        | awk '{print $5}' | sed 's/:$//; s/\.\([0-9]*\)$/:\1/' | sort -u
+}
+# Addresses of the entry guards named in a guard file.
+guard_addrs() {
+    for nick in $(grep -o '"nickname": "[^"]*"' "$1" | cut -d'"' -f4); do
+        for r in $RELAYS; do
+            IFS=: read -r n role m host port <<<"$r"
+            if [[ $n == "$nick" ]]; then echo "10.77.0.$host:$port"; fi
+        done
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------- start
 start authority auth "$BIN/mask-authority" run --config authority.toml
 for r in $RELAYS; do
@@ -202,6 +234,65 @@ if [[ $BROWSER == 1 ]]; then
     in_ns cli ss -Htn | awk '{print "        " $4 " -> " $5}'
     wait "$BPID" || true
 fi
+
+# ---------------------------------------------- packet-capture checks
+if [[ $CAPTURE == 1 ]]; then
+    kill -INT "${PROC_PID[tcpdump]}" 2>/dev/null || true
+    wait "${PROC_PID[tcpdump]}" 2>/dev/null || true
+    unset 'PROC_PID[tcpdump]'
+    P="$WORK/lan.pcap"
+    total=$(read_pcap "$P" | wc -l)
+    [[ $total -gt 100 ]] && pass "packet capture recorded the run ($total packets on the LAN)" \
+        || fail "packet capture is (nearly) empty ($total packets)"
+    dns=$(read_pcap "$P" 'port 53' | wc -l)
+    [[ $dns -eq 0 ]] && pass "capture: no DNS packet at all on the LAN" || fail "capture: $dns DNS packet(s)"
+    direct=$(read_pcap "$P" 'host 10.77.0.30 and host 10.77.0.20' | wc -l)
+    [[ $direct -eq 0 ]] && pass "capture: not a single packet between cli and svc" \
+        || fail "capture: $direct packet(s) between cli and svc"
+    cli_guards="$WORK/runtime/state/client-guards-netns-testnet.json"
+    svc_id=$(basename "$(dirname "$(ls services/*/service.key)")")
+    svc_guards="$WORK/services/$svc_id/service-guards-netns-testnet.json"
+    for who in cli svc; do
+        if [[ $who == cli ]]; then ip=10.77.0.30; file=$cli_guards; else ip=10.77.0.20; file=$svc_guards; fi
+        if [[ ! -f $file ]]; then fail "$who has no guard file ($file)"; continue; fi
+        mode=$(stat -c %a "$file")
+        allowed="10.77.0.10:7300 $(guard_addrs "$file" | tr '\n' ' ')"
+        bad=""
+        for t in $(syn_targets "$P" "$ip"); do
+            [[ " $allowed " == *" $t "* ]] || bad="$bad $t"
+        done
+        if [[ -z $bad && $mode == 600 ]]; then
+            pass "capture: $who connected only to the authority and its entry guards ($(guard_addrs "$file" | tr '\n' ' ')); guard file mode $mode"
+        else
+            fail "capture: $who connected to non-guard hosts:$bad (guard file mode $mode)"
+        fi
+    done
+    id_text=${URL#morp://}; id_text=${id_text%%.*}
+    secrets=0
+    for needle in "Hello across network namespaces" "GET /" "$id_text"; do
+        n=$(read_pcap "$P" -A | grep -c -- "$needle" || true)
+        secrets=$((secrets + n))
+    done
+    [[ $secrets -eq 0 ]] && pass "capture: page content, requests, and the .morp address never appear in clear" \
+        || fail "capture: $secrets packet(s) carry page content, requests, or the address in clear"
+fi
+
+# --------------------------------------------- blocked connections fail closed
+info "black-holing cli's routes to every entry relay"
+for r in $RELAYS; do
+    IFS=: read -r nick role m host port <<<"$r"
+    [[ $role == entry ]] && in_ns cli ip route replace blackhole "10.77.0.$host/32"
+done
+if out=$(in_ns cli "$BIN/mask-service" --network network.toml --state-dir "$WORK/blocked-state" \
+        fetch "$URL" / 2>&1); then
+    fail "fetch succeeded with every entry relay blocked"
+else
+    pass "with its entry relays blocked, cli fails closed: $(tail -1 <<<"$out" | cut -c1-150)"
+fi
+for r in $RELAYS; do
+    IFS=: read -r nick role m host port <<<"$r"
+    [[ $role == entry ]] && in_ns cli ip route replace "10.77.0.$host/32" dev eth0
+done
 
 # ------------------------------------------------ disconnected machine
 info "cutting m2's network cable (middle1 + rv2 vanish without closing TCP)"
